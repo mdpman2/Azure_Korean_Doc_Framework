@@ -5,7 +5,7 @@
 ## 🚀 주요 특징
 
 - **Multi-Model Support**: GPT-4.1, GPT-5.2, claude-sonnet-4-5, claude-opus-4-5등 다양한 LLM을 동적으로 교체하며 사용 가능합니다.
-- **Hybrid Document Parsing**: Azure Document Intelligence와 GPT-4o Vision을 연동하여 텍스트뿐만 아니라 차트, 표, 이미지의 의미를 텍스트로 추출하여 검색 성능을 극대화합니다.
+- **Hybrid Document Parsing**: Azure Document Intelligence와 GPT-4.1을 연동하여 텍스트뿐만 아니라 차트, 표, 이미지의 의미를 텍스트로 추출하여 검색 성능을 극대화합니다.
 - **Korean Semantic Chunking**: 단순 길이 기반 분할이 아닌, 마크다운 구조와 문맥의 의미를 파악하는 시맨틱 청킹을 지원합니다.
 - **Azure AI Search Integration**: 한국어 최적화 분석기(`ko.microsoft`)와 벡터 검색을 활용한 하이브리드 검색 환경을 제공합니다.
 
@@ -146,3 +146,4 @@ if __name__ == "__main__":
 ## 🤝 참조 프로젝트
 - [Tencent WeKnora](https://github.com/Tencent/WeKnora)
 - [Microsoft Agent Framework Samples](https://github.com/microsoft/agent-framework)
+
