@@ -36,6 +36,9 @@ class Config:
     # 임베딩 모델 배포명
     EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
 
+    # Contextual Retrieval용 GPT-4o 배포명 (기본값: gpt-4.1 - 배포가 없는 경우 대비)
+    GPT_4O_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_GPT4O_DEPLOYMENT", os.getenv("MODEL_DEPLOYMENT_GPT4_1", "gpt-4.1"))
+
     # Azure Document Intelligence 설정
     DI_KEY = os.getenv("AZURE_DI_KEY")
     DI_ENDPOINT = os.getenv("AZURE_DI_ENDPOINT")

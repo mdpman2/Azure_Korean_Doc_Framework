@@ -1,149 +1,206 @@
-# Azure Korean Document Understanding & Retrieval Framework
+# 🇰🇷 Azure Korean Document Framework
 
-이 프레임워크는 한국어 문서의 깊은 이해(Deep Document Understanding)와 효율적인 검색(Retrieval)을 위해 설계되었습니다. Tencent의 WeKnora 및 Microsoft Agent Framework의 주요 패턴을 차용하여 Azure AI 기술과 한국어 최적화 로직을 결합했습니다.
+> 한국어 문서 이해 및 검색을 위한 RAG(Retrieval-Augmented Generation) 프레임워크
 
-## 🚀 주요 특징
+## ✨ 한눈에 보기
 
-- **Multi-Model Support**: GPT-4.1, GPT-5.2, claude-sonnet-4-5, claude-opus-4-5등 다양한 LLM을 동적으로 교체하며 사용 가능합니다.
-- **Hybrid Document Parsing**: Azure Document Intelligence와 GPT-4.1을 연동하여 텍스트뿐만 아니라 차트, 표, 이미지의 의미를 텍스트로 추출하여 검색 성능을 극대화합니다.
-- **Korean Semantic Chunking**: 단순 길이 기반 분할이 아닌, 마크다운 구조와 문맥의 의미를 파악하는 시맨틱 청킹을 지원합니다.
-- **Azure AI Search Integration**: 한국어 최적화 분석기(`ko.microsoft`)와 벡터 검색을 활용한 하이브리드 검색 환경을 제공합니다.
-
-## 📂 디렉토리 구조
-
-```text
-azure_korean_doc_framework/
-├── core/
-│   ├── agent.py               # RAG 오케스트레이션 및 답변 생성 기반
-│   ├── multi_model_manager.py # GPT/Claude 멀티 모델 관리 및 호출
-│   └── vector_store.py        # Azure AI Search 인덱스 및 업로드 관리
-├── parsing/
-│   ├── parser.py              # Azure DI + GPT Vision 기반 하이브리드 파서
-│   └── chunker.py             # 마크다운 헤더 및 시맨틱 청커
-├── utils/
-│   └── azure_clients.py       # Azure 서비스 클라이언트 팩토리
-├── config.py                  # 환경 변수 및 설정 관리
-└── README.md                  # 본 문서
+```
+📄 PDF 문서 → 🔍 Azure DI 파싱 → ✂️ 스마트 청킹 → 🗄️ 벡터 검색 → 🤖 AI 답변
 ```
 
-## 🛠️ 설치 및 설정
+| 기능 | 설명 |
+|------|------|
+| **문서 파싱** | Azure Document Intelligence + GPT Vision으로 텍스트, 표, 이미지 추출 |
+| **한국어 청킹** | `kss` 기반 문장 분리 + 토큰 기반 오버랩 청킹 |
+| **벡터 검색** | Azure AI Search의 하이브리드 검색 (키워드 + 벡터) |
+| **멀티 모델** | GPT-4.1, GPT-5.2, Claude 등 다양한 LLM 지원 |
 
-### 1. 필수 라이브러리 설치
+---
+
+## 💎 왜 이 프레임워크인가요? (Advantages)
+
+1.  **한국어 최적화 (Korean-Centric)**: 일반적인 공백 기반 분할이 아닌, `kss` 라이브러리를 통해 한국어 문장 경계를 정확히 인식합니다.
+2.  **구조 분석 기반 (Structure-Aware)**: 단순 길이 기반 분할 대신 문서의 제목(`header`), 표(`table`), 이미지(`image`) 구조를 이해하고 문맥을 보존합니다.
+3.  **동적 전략 선택 (Adaptive Strategy)**: 문서의 성격(법률, 통계, 일반 보고서 등)을 파악하여 자동으로 최적의 청킹 전략(`LEGAL`, `TABULAR` 등)을 적용합니다.
+4.  **문맥 보존 (Context-Rich)**: 상위 제목(Breadcrumb)정보를 하위 청크에 주입하여, 각 청크가 독립적으로도 충분한 의미를 가질 수 있게 합니다.
+
+---
+
+## 🔄 RAG 청킹 프로세스 (Step-by-Step)
+
+이 프레임워크는 단순히 글자를 자르는 것이 아니라, 다음의 정교한 단계를 거칩니다:
+
+1.  **데이터 파싱 (Parsing)**: Azure Document Intelligence를 사용하여 문서의 계층 구조(H1, H2, H3...)와 표, 이미지 설명을 추출합니다.
+2.  **의미 단위 세그먼트화 (Segmentation)**: 추출된 데이터를 의미가 연결되는 블록 단위로 그룹화합니다.
+3.  **한국어 문장 분리 (Sentence Splitting)**: `kss`를 사용하여 각 블록 내의 한국어 문장을 정확하게 하나하나 분리합니다.
+4.  **토큰 정밀 카운팅 (Token Counting)**: `tiktoken`을 사용하여 LLM(GPT-4/5)이 이해하는 실제 토큰 단위로 길이를 계산합니다.
+5.  **슬라이딩 윈도우 오버랩 (Overlap Grouping)**: 설정된 토큰 제한(Max Tokens)에 맞춰 문장들을 묶되, 청크 간에 일정한 오버랩(Overlap)을 두어 정보 단절을 방지합니다.
+6.  **메타데이터 강화 (Enrichment)**: 각 청크에 파일명, 페이지 번호, 상위 제목 경로, 토큰 수 등의 정보를 주입합니다.
+7.  **벡터 인덱싱 (Indexing)**: 최종 가공된 청크를 벡터로 변환하여 Azure AI Search에 안전하게 저장합니다.
+
+---
+
+## 📦 설치
+
 ```bash
-pip install openai azure-ai-documentintelligence azure-search-documents langchain langchain-openai langchain-experimental pdf2image pillow python-dotenv
+pip install openai azure-ai-documentintelligence azure-search-documents \
+    langchain langchain-openai langchain-experimental \
+    pymupdf pillow python-dotenv tiktoken kss
 ```
-> [!NOTE]
-> PDF 시각적 분석 기능을 위해서는 시스템에 `poppler`가 설치되어 있어야 합니다.
 
-### 2. 환경 변수 설정
-프로젝트 루트 폴더에 `.env` 파일을 생성하고 `.env.template`의 내용을 복사하여 Azure 정보를 입력하세요.
+---
+
+## ⚡ 빠른 시작
+
+### 1단계: 환경 변수 설정
+
+`.env` 파일을 생성하고 Azure 정보를 입력하세요:
 
 ```env
-AZURE_OPENAI_API_KEY=...
-AZURE_OPENAI_ENDPOINT=...
+AZURE_OPENAI_API_KEY=your-api-key
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
+AZURE_SEARCH_API_KEY=your-search-key
 MODEL_DEPLOYMENT_GPT4_1=gpt-4.1
-AZURE_SEARCH_ENDPOINT=...
-# ... (기타 설정)
 ```
 
-## 📖 사용 방법
-
-### 기본 실행 (`main.py`)
-프레임워크의 전체 흐름(문서 파싱 -> 청킹 -> 검색 인덱싱 -> 멀티 모델 실습)을 한 번에 확인할 수 있습니다.
+### 2단계: 문서 처리 실행
 
 ```bash
-python main.py
+# 단일 파일 처리
+python doc_chunk_main.py --path "문서.pdf"
+
+# 디렉토리 전체 처리
+python doc_chunk_main.py --path "문서폴더/"
+
+# Q&A 테스트 포함
+python doc_chunk_main.py --path "문서.pdf" --question "문서 내용을 요약해줘"
 ```
 
-### 코드 예시
+---
 
-#### 1. 인코딩 및 멀티 모델 답변
+## 🧩 핵심 컴포넌트
+
+### 📁 디렉토리 구조
+
+```
+azure_korean_doc_framework/
+├── core/
+│   ├── agent.py              # RAG 에이전트 (질의 응답)
+│   ├── multi_model_manager.py # 멀티 LLM 관리
+│   └── vector_store.py       # Azure AI Search 연동
+├── parsing/
+│   ├── parser.py             # 문서 파싱 (Azure DI + GPT Vision)
+│   └── chunker.py            # 스마트 청킹
+├── utils/
+│   └── azure_clients.py      # Azure 클라이언트 팩토리
+└── config.py                 # 설정 관리
+```
+
+---
+
+## ⚙️ 청킹 설정
+
+### 기본 사용법
+
+```python
+from azure_korean_doc_framework.parsing.chunker import AdaptiveChunker
+
+chunker = AdaptiveChunker()  # 기본 설정으로 사용
+```
+
+### 커스텀 설정
+
+```python
+from azure_korean_doc_framework.parsing.chunker import ChunkingConfig, AdaptiveChunker
+
+config = ChunkingConfig(
+    min_tokens=100,      # 최소 청크 크기
+    max_tokens=500,      # 최대 청크 크기
+    overlap_tokens=50,   # 청크 간 오버랩 (문맥 연속성)
+)
+chunker = AdaptiveChunker(config=config)
+```
+
+### 청킹 전략 (자동 선택)
+
+| 전략 | 적용 조건 | 특징 |
+|------|----------|------|
+| **LEGAL** | 판례, 법률 문서 | 【주문】, 【이유】 등 구조 인식 |
+| **TABULAR** | 표 중심 문서 | 표를 자연어 문장으로 변환 |
+| **HIERARCHICAL** | 제목 구조 문서 | Breadcrumb 기반 문맥 보존 |
+| **FALLBACK** | 기타 문서 | 오버랩 적용 단순 분할 |
+
+---
+
+## 💡 코드 예시
+
+### Q&A 에이전트 사용
+
 ```python
 from azure_korean_doc_framework.core.agent import KoreanDocAgent
 
 agent = KoreanDocAgent()
-# GPT-5.1 또는 Claude 등 원하는 모델 명시 가능
-answer = agent.answer_question("회사의 복지 정책에 대해 알려줘", model_key="gpt-5.2")
+answer = agent.answer_question(
+    "회사의 복지 정책은?",
+    model_key="gpt-5.2"  # 또는 "gpt-4.1", "claude-sonnet-4-5"
+)
 print(answer)
 ```
 
-#### 2. 하이브리드 문서 파싱
+### 문서 파싱만 사용
+
 ```python
 from azure_korean_doc_framework.parsing.parser import HybridDocumentParser
 
 parser = HybridDocumentParser()
-markdown_text = parser.parse("document.pdf")
-print(markdown_text) # 텍스트 + 표 + 이미지 설명이 포함된 마크다운
+segments = parser.parse("문서.pdf")
+# segments = [{"type": "text", "content": "..."}, {"type": "table", "content": "..."}]
 ```
 
-#### 3. 전체 사용 방법 : 파싱 > 청킹 > 인덱싱 > Q&A
+### 전체 파이프라인
+
 ```python
-import os
 from azure_korean_doc_framework.parsing.parser import HybridDocumentParser
-from azure_korean_doc_framework.parsing.chunker import KoreanSemanticChunker
+from azure_korean_doc_framework.parsing.chunker import AdaptiveChunker
 from azure_korean_doc_framework.core.vector_store import VectorStore
 from azure_korean_doc_framework.core.agent import KoreanDocAgent
 
-def main():
-    print("🌟 Welcome to Azure Korean Document Understanding & Retrieval Framework 🌟")
+# 1. 컴포넌트 초기화
+parser = HybridDocumentParser()
+chunker = AdaptiveChunker()
+vector_store = VectorStore()
 
-    # 1. Initialize Components
-    parser = HybridDocumentParser()
-    chunker = KoreanSemanticChunker()
-    vector_store = VectorStore()
+# 2. 문서 처리
+segments = parser.parse("문서.pdf")
+chunks = chunker.chunk(segments, filename="문서.pdf")
+vector_store.upload_documents(chunks)
 
-    # 2. Document Ingestion (Example)
-    # 실제 파일 경로로 수정 필요
-    sample_file = "RAG_TEST_DATA/(1) 2024 달라지는 세금제도.pdf"
-
-    if os.path.exists(sample_file):
-        print(f"\n--- [Phase 1: Ingestion - {sample_file}] ---")
-        # [수정] 파일 수정 시간 확인 및 업데이트 로직 적용
-        file_mod_time = os.path.getmtime(sample_file)
-
-        vector_store.create_index_if_not_exists()
-
-        # 최신 상태인지 확인
-        if vector_store.is_file_up_to_date(os.path.basename(sample_file), file_mod_time):
-             print(f"⏩ File is up-to-date. Skipping parsing/upload.")
-        else:
-            print(f"🔄 File updated or new. Processing...")
-            # 기존 데이터 삭제 (업데이트 시)
-            vector_store.delete_documents_by_parent_id(os.path.basename(sample_file))
-
-            # 파싱 및 청킹
-            markdown_content = parser.parse(sample_file)
-
-            # 메타데이터에 파일명과 수정 시간 추가
-            extra_meta = {
-                "source": os.path.basename(sample_file),
-                "last_modified": file_mod_time
-            }
-            chunks = chunker.chunk(markdown_content, extra_metadata=extra_meta)
-
-            vector_store.upload_documents(chunks)
-    else:
-        print(f"\nℹ️ Skip ingestion: {sample_file} not found. Running Q&A with existing search index.")
-
-    # 3. Multi-Model Q&A Demonstration
-    agent = KoreanDocAgent()
-    question = "이 문서에서 가장 중요한 핵심 요약 세 가지만 말해줘."
-
-    models_to_test = ["gpt-4.1", "gpt-5.2", "claude-sonnet-4-5"]
-
-    print("\n--- [Phase 2: Multi-Model Q&A] ---")
-    print(f"User Question: {question}")
-
-    for model in models_to_test:
-        print(f"\n--- Model: {model} ---")
-        answer = agent.answer_question(question, model_key=model)
-        print(f"Response:\n{answer}")
-
-if __name__ == "__main__":
-    main()
+# 3. 질의 응답
+agent = KoreanDocAgent()
+answer = agent.answer_question("문서 내용을 요약해줘")
+print(answer)
 ```
 
-## 🤝 참조 프로젝트
-- [Tencent WeKnora](https://github.com/Tencent/WeKnora)
-- [Microsoft Agent Framework Samples](https://github.com/microsoft/agent-framework)
+---
 
+## 📊 청크 메타데이터
+
+각 청크에는 다음 정보가 포함됩니다:
+
+| 필드 | 설명 | 예시 |
+|------|------|------|
+| `chunk_index` | 청크 순번 | `0`, `1`, `2` |
+| `total_chunks` | 전체 청크 수 | `39` |
+| `token_count` | 토큰 수 | `485` |
+| `char_count` | 문자 수 | `2235` |
+| `breadcrumb` | 섹션 경로 | `"1장 > 개요 > 배경"` |
+| `source` | 원본 파일명 | `"문서.pdf"` |
+
+---
+
+## 🔗 참고 자료
+
+- [Azure Document Intelligence](https://learn.microsoft.com/azure/ai-services/document-intelligence/)
+- [Azure AI Search](https://learn.microsoft.com/azure/search/)
+- [LangChain](https://python.langchain.com/)
