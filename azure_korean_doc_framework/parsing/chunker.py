@@ -146,13 +146,66 @@ class AdaptiveChunker:
         })
         return enriched
 
+    # ==================== 표/이미지 청크 분리 ====================
+
+    def _extract_special_chunks(
+        self,
+        segments: List[Dict[str, Any]],
+        extra_metadata: Dict[str, Any]
+    ) -> List[Document]:
+        """
+        표(table)와 이미지(image) 세그먼트를 별도 청크로 분리합니다.
+        검색 최적화를 위해 독립적인 청크로 생성합니다.
+        """
+        special_chunks = []
+
+        for seg in segments:
+            seg_type = seg.get("type", "")
+            content = seg.get("content", "").strip()
+
+            if not content:
+                continue
+
+            if seg_type == "table":
+                # 표를 별도 청크로 생성
+                meta = extra_metadata.copy()
+                meta.update({
+                    "type": "table",
+                    "is_table_data": True,
+                    "page": seg.get("page", 1),
+                    "searchable": True  # 검색 최적화 플래그
+                })
+                special_chunks.append(Document(page_content=content, metadata=meta))
+
+            elif seg_type == "image":
+                # 이미지 설명을 별도 청크로 생성
+                meta = extra_metadata.copy()
+                meta.update({
+                    "type": "image_description",
+                    "is_image_data": True,
+                    "page": seg.get("page", 1),
+                    "searchable": True
+                })
+                special_chunks.append(Document(page_content=content, metadata=meta))
+
+        return special_chunks
+
     # ==================== 메인 청킹 로직 ====================
 
     def chunk(self, segments: List[Dict[str, Any]], filename: str = "", extra_metadata: Optional[Dict[str, Any]] = None) -> List[Document]:
         """
         Main Entrypoint: 문서 세그먼트를 입력받아 적절한 전략으로 청킹을 수행합니다.
+
+        개선 사항:
+        - 표/이미지/번호목록 구조 보존
+        - 유형별 청크 분리 생성
+        - 검색 최적화를 위한 메타데이터 강화
         """
         if extra_metadata is None: extra_metadata = {}
+
+        # 0. 표/이미지 세그먼트 별도 청크로 분리 (검색 최적화)
+        table_image_chunks = self._extract_special_chunks(segments, extra_metadata)
+        print(f"   📊 Extracted {len(table_image_chunks)} table/image chunks for search optimization")
 
         # 1. 문서 분류
         strategy = self._classify_document(filename, segments)
@@ -169,6 +222,9 @@ class AdaptiveChunker:
         else:
             chunks = self._chunk_fallback(segments, extra_metadata)
 
+        # 2.5. 표/이미지 별도 청크 병합
+        chunks.extend(table_image_chunks)
+
         # 3. 최종 메타데이터 강화
         total = len(chunks)
         for i, chunk in enumerate(chunks):
@@ -180,7 +236,24 @@ class AdaptiveChunker:
                 section_title=chunk.metadata.get("breadcrumb", "")
             )
 
+            # 청크 유형별 추가 정보
+            content = chunk.page_content
+            if '> **[이미지/차트 설명' in content:
+                chunk.metadata['contains_image_desc'] = True
+            if re.search(r'###?\s*\d{2}\.', content):
+                chunk.metadata['contains_numbered_section'] = True
+            if '|' in content and '---' in content:
+                chunk.metadata['contains_table'] = True
+
+        # 청크 유형별 통계
+        table_chunks = sum(1 for c in chunks if c.metadata.get('is_table_data'))
+        image_chunks = sum(1 for c in chunks if c.metadata.get('is_image_data'))
+        text_chunks = total - table_chunks - image_chunks
+
         print(f"   ✅ Generated {total} chunks")
+        print(f"      - Text chunks: {text_chunks}")
+        print(f"      - Table chunks: {table_chunks}")
+        print(f"      - Image chunks: {image_chunks}")
         return chunks
 
     def _classify_document(self, filename: str, segments: List[Dict[str, Any]]) -> ChunkingStrategy:

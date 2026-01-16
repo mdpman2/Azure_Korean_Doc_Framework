@@ -24,16 +24,40 @@ class HybridDocumentParser:
         pil_image.save(buffered, format="JPEG")
         return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    def _describe_image(self, pil_image: Image.Image, image_idx: int) -> str:
+    def _describe_image(self, pil_image: Image.Image, image_idx: int, context_hint: str = "") -> str:
         """GPT-4o를 사용하여 이미지의 핵심 인사이트를 텍스트로 추출"""
         print(f"   🤖 Model Analyzing Figure #{image_idx}...")
         base64_img = self._encode_image_base64(pil_image)
 
-        system_prompt = (
-            "당신은 데이터 분석 전문가입니다. 주어진 이미지(차트, 표, 다이어그램 등)를 보고 "
-            "RAG(검색 증강 생성) 시스템이 이해할 수 있도록 상세하게 설명하세요. "
-            "단순한 시각적 묘사보다는, '데이터의 수치', '추세', '핵심 메시지'를 한국어로 명확히 서술하세요."
-        )
+        system_prompt = """당신은 한글 문서 분석 전문가입니다. 주어진 이미지를 보고 RAG(검색 증강 생성) 시스템이 이해할 수 있도록 상세하게 설명하세요.
+
+[이미지 유형별 분석 가이드]
+1. **소프트웨어 스크린샷/UI 화면**:
+   - 어떤 프로그램/메뉴인지 명시
+   - 클릭해야 할 버튼, 메뉴 경로, 설정값을 정확히 기술
+   - 단계별 조작 방법이 보이면 순서대로 설명
+
+2. **표(Table)**:
+   - 행/열 구조를 파악하고 데이터를 텍스트로 변환
+   - 번호(No.), 항목명, 설명 등 컬럼 정보 유지
+   - 셀 병합이 있으면 해당 관계 설명
+
+3. **다이어그램/순서도**:
+   - 화살표 방향, 흐름 순서 설명
+   - 각 단계/노드의 내용 기술
+
+4. **차트/그래프**:
+   - 데이터 수치, 추세, 핵심 메시지 서술
+   - 범례, 축 레이블 정보 포함
+
+[출력 규칙]
+- 한국어로 명확하게 서술
+- 검색에 유용한 키워드를 포함
+- 단순 시각 묘사보다 '무엇을 할 수 있는지', '어떤 정보인지' 중심으로 설명"""
+
+        user_prompt = "이 이미지의 내용을 상세히 설명해줘."
+        if context_hint:
+            user_prompt += f"\n\n참고 문맥: {context_hint}"
 
         try:
             response = self.aoai_client.chat.completions.create(
@@ -41,11 +65,12 @@ class HybridDocumentParser:
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": [
-                        {"type": "text", "text": "이 이미지의 내용을 상세히 설명해줘."},
+                        {"type": "text", "text": user_prompt},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
                     ]}
                 ],
-                temperature=0.0
+                temperature=0.0,
+                max_tokens=1500
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -56,6 +81,30 @@ class HybridDocumentParser:
 
             print(f"   ❌ Error analyzing image: {e}")
             return "[이미지 분석 실패]"
+
+    def _extract_context_around_offset(self, segments: List[Dict[str, Any]], target_offset: int, window: int = 300) -> str:
+        """특정 오프셋 주변의 텍스트 문맥을 추출합니다."""
+        context_parts = []
+        for seg in segments:
+            seg_offset = seg.get("offset", 0)
+            if abs(seg_offset - target_offset) < window and seg.get("type") in ["text", "header"]:
+                context_parts.append(seg.get("content", "")[:200])
+        return " ".join(context_parts)[:400]
+
+    def _enhance_numbered_content(self, content: str, role: str = None) -> Tuple[str, str]:
+        """번호 목록 형식을 개선하고 유형을 반환합니다."""
+        import re
+
+        # "06 제목" 또는 "06. 제목" 형식 감지
+        numbered_pattern = r'^(\d{2})\.?\s+(.+)$'
+        match = re.match(numbered_pattern, content.strip())
+
+        if match:
+            num, title = match.groups()
+            enhanced_content = f"### {num}. {title}"
+            return enhanced_content, "numbered_section"
+
+        return content, "text" if role is None else role
 
     def _pdf_to_images(self, file_path: str, dpi: int = 200) -> Optional[List[Image.Image]]:
         """PyMuPDF를 사용하여 PDF 페이지를 이미지로 변환합니다."""
@@ -138,6 +187,12 @@ class HybridDocumentParser:
             if role in ["sectionHeading", "title", "pageHeader"]:
                 seg_type = "header"
 
+            # 번호 목록 형식 개선 (06, 07 등)
+            enhanced_content, detected_type = self._enhance_numbered_content(content, role)
+            if detected_type == "numbered_section":
+                seg_type = "header"
+                content = enhanced_content
+
             segments.append({
                 "type": seg_type,
                 "content": content,
@@ -197,10 +252,14 @@ class HybridDocumentParser:
                     if cropped_img.width < 50 or cropped_img.height < 50:
                         continue
 
-                    desc_text = self._describe_image(cropped_img, idx + 1)
+                    # 이미지 주변 문맥 추출
+                    start_offset = figure.spans[0].offset if figure.spans else 0
+                    context_hint = self._extract_context_around_offset(segments, start_offset)
+
+                    # 문맥 힌트와 함께 이미지 분석
+                    desc_text = self._describe_image(cropped_img, idx + 1, context_hint)
 
                     # Figure 세그먼트 추가
-                    start_offset = figure.spans[0].offset if figure.spans else 0
                     segments.append({
                         "type": "image",
                         "content": f"> **[이미지/차트 설명 {idx+1}]**\n> {desc_text}",
