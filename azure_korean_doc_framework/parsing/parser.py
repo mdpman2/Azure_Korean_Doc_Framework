@@ -10,13 +10,21 @@ from ..config import Config
 class HybridDocumentParser:
     """
     다양한 문서 형식(PDF, PPTX, DOCX)을 처리하여 구조화된 세그먼트를 추출하는 파서.
-    Azure Document Intelligence(Layout Model)와 GPT-4o(Vision)를 결합하여 사용.
+    Azure Document Intelligence(Layout Model) + GPT-5.2(Vision + Reasoning)를 결합하여 사용.
+
+    [2026-01 업데이트]
+    - GPT-5.2 Vision 사용 (향상된 이미지 분석)
+    - Structured Outputs 지원
+    - max_completion_tokens 파라미터 사용
+    - 향상된 한국어 OCR 지원
     """
 
-    def __init__(self):
+    def __init__(self, vision_model: str = None):
         self.di_client = AzureClientFactory.get_di_client()
-        self.aoai_client = AzureClientFactory.get_openai_client()
-        self.gpt_model = Config.MODELS.get("gpt-4.1") # Default for vision/parsing
+        # GPT-5.2 지원을 위해 is_advanced=True로 클라이언트 초기화
+        self.aoai_client = AzureClientFactory.get_openai_client(is_advanced=True)
+        # Vision 모델: GPT-5.2 기본 사용 (Config.VISION_MODEL)
+        self.gpt_model = vision_model or Config.MODELS.get(Config.VISION_MODEL, "gpt-5.2")
 
     def _encode_image_base64(self, pil_image: Image.Image) -> str:
         """PIL 이미지를 Base64 문자열로 인코딩합니다."""
@@ -60,18 +68,28 @@ class HybridDocumentParser:
             user_prompt += f"\n\n참고 문맥: {context_hint}"
 
         try:
-            response = self.aoai_client.chat.completions.create(
-                model=self.gpt_model,
-                messages=[
+            # GPT-5.x 시리즈는 max_completion_tokens 사용
+            is_gpt5 = "gpt-5" in self.gpt_model.lower()
+
+            completion_params = {
+                "model": self.gpt_model,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": [
                         {"type": "text", "text": user_prompt},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
                     ]}
                 ],
-                temperature=0.0,
-                max_tokens=1500
-            )
+                "temperature": 0.0,
+            }
+
+            # GPT-5.x: max_completion_tokens, 기타: max_tokens
+            if is_gpt5:
+                completion_params["max_completion_tokens"] = 2000
+            else:
+                completion_params["max_tokens"] = 2000
+
+            response = self.aoai_client.chat.completions.create(**completion_params)
             return response.choices[0].message.content
         except Exception as e:
             error_msg = str(e)

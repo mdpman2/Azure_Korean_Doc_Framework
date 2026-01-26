@@ -8,36 +8,97 @@ class Config:
     """
     프레임워크의 모든 설정을 관리하는 중앙 구성 클래스입니다.
     환경 변수(.env)에서 설정값을 읽어옵니다.
+
+    [2026-01 업데이트]
+    - GPT-5.2 기본 모델로 전환 (Vision + Reasoning 통합)
+    - API Version: v1 (GA) 또는 2025-01-01-preview
+    - Structured Outputs 지원
+    - max_completion_tokens 파라미터 사용
+    - Document Intelligence API: 2024-11-30 (GA)
     """
 
-    # Azure OpenAI (표준 모델용 - GPT-4 등)
+    # =================================================================
+    # Azure OpenAI 설정 (GPT-5.2, Claude 등 최신 모델 지원)
+    # =================================================================
+
+    # 기본 엔드포인트 (GPT-5.2 지원)
     OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
     OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-    OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
 
-    # Azure OpenAI (고성능 모델 전용 엔드포인트 - GPT-5, Claude 등)
+    # API 버전 (환경 변수 우선, 기본값: 2024-12-01-preview)
+    OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+
+    # 고성능 모델 전용 엔드포인트 (GPT-5.2, Claude 등)
     OPENAI_API_KEY_5 = os.getenv("OPEN_AI_KEY_5")
     OPENAI_ENDPOINT_5 = os.getenv("OPEN_AI_ENDPOINT_5")
 
-    # 모델 배포 설정 (추천 값: model-router 사용 시 유연한 모델 교체 가능)
+    # =================================================================
+    # 모델 배포 설정 (2026년 최신 모델)
+    # NOTE: Azure AI Foundry에서 model-router를 통해 GPT-5.x 접근
+    # =================================================================
     MODELS = {
-        "gpt-4.1": os.getenv("MODEL_DEPLOYMENT_GPT4_1", "gpt-4.1"),
+        # GPT-5.x 시리즈 (model-router를 통해 최신 모델 자동 라우팅)
         "gpt-5.2": os.getenv("MODEL_DEPLOYMENT_GPT5_2", "model-router"),
+        "gpt-5.1": os.getenv("MODEL_DEPLOYMENT_GPT5_1", "model-router"),
+        "gpt-5": os.getenv("MODEL_DEPLOYMENT_GPT5", "model-router"),
+        "gpt-5-mini": os.getenv("MODEL_DEPLOYMENT_GPT5_MINI", "model-router"),
+
+        # GPT-4.x 시리즈 (직접 배포)
+        "gpt-4.1": os.getenv("MODEL_DEPLOYMENT_GPT4_1", "gpt-4.1"),
+
+        # o-시리즈 추론 모델 (model-router 사용)
+        "o3": os.getenv("MODEL_DEPLOYMENT_O3", "model-router"),
+        "o4-mini": os.getenv("MODEL_DEPLOYMENT_O4_MINI", "model-router"),
+
+        # Claude 모델 (model-router 사용)
         "claude-opus-4-5": os.getenv("MODEL_DEPLOYMENT_CLAUDE_OPUS", "model-router"),
         "claude-sonnet-4-5": os.getenv("MODEL_DEPLOYMENT_CLAUDE_SONNET", "model-router"),
     }
 
-    # 고성능 엔드포인트를 사용할 모델 리스트
-    ADVANCED_MODELS = ["gpt-5.2", "claude-opus-4-5", "claude-sonnet-4-5"]
+    # 고성능 엔드포인트를 사용할 모델 리스트 (frozenset으로 멤버쉽 검사 O(1))
+    ADVANCED_MODELS = frozenset([
+        "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
+        "o3", "o4-mini",
+        "claude-opus-4-5", "claude-sonnet-4-5"
+    ])
 
-    # 기본 질문 답변 모델
-    DEFAULT_MODEL = "gpt-4.1"
+    # Reasoning 지원 모델 (reasoning_effort 파라미터 사용 가능)
+    REASONING_MODELS = frozenset([
+        "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
+        "o3", "o4-mini"
+    ])
 
-    # 임베딩 모델 배포명
+    # Structured Outputs 지원 모델
+    STRUCTURED_OUTPUT_MODELS = frozenset([
+        "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
+        "gpt-4.1", "o3", "o4-mini"
+    ])
+
+    # =================================================================
+    # 기본 모델 설정
+    # =================================================================
+
+    # 기본 질문 답변 모델 (GPT-5.2로 업그레이드)
+    DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.2")
+
+    # Vision/이미지 분석용 모델 (GPT-5.2 Vision 사용)
+    VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.2")
+
+    # 문서 파싱용 모델
+    PARSING_MODEL = os.getenv("PARSING_MODEL", "gpt-5.2")
+
+    # =================================================================
+    # 임베딩 설정
+    # =================================================================
+
+    # 임베딩 모델 배포명 (text-embedding-3-small 또는 text-embedding-3-large)
     EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
 
-    # Contextual Retrieval용 GPT-4o 배포명 (기본값: gpt-4.1 - 배포가 없는 경우 대비)
-    GPT_4O_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_GPT4O_DEPLOYMENT", os.getenv("MODEL_DEPLOYMENT_GPT4_1", "gpt-4.1"))
+    # 임베딩 차원 (text-embedding-3-small: 1536, large: 3072)
+    EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
+
+    # Contextual Retrieval용 모델
+    GPT_4O_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_GPT4O_DEPLOYMENT", "gpt-5.2")
 
     # Azure Document Intelligence 설정
     DI_KEY = os.getenv("AZURE_DI_KEY")

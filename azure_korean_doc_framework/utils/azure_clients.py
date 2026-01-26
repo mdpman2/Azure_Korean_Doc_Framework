@@ -23,27 +23,25 @@ class AzureClientFactory:
     def get_openai_client(is_advanced=False):
         """
         Azure OpenAI 클라이언트를 반환합니다.
-        is_advanced=True일 경우 Endpoint 5(고성능 모델용) 클라이언트를 반환합니다.
+
+        NOTE: 현재 환경에서는 OPENAI_API_KEY_5/ENDPOINT_5가 기본 엔드포인트와 동일하므로
+              모든 요청에 고성능 엔드포인트를 사용합니다.
         """
-        cache_key = f"openai_{'advanced' if is_advanced else 'standard'}"
+        # 단일 클라이언트로 통합 (캐시 키 고정)
+        cache_key = "openai_unified"
 
         def create_client():
-            if is_advanced:
-                # 고성능 모델(GPT-5, Claude 등)을 위한 보조 엔드포인트 설정 확인
-                if not Config.OPENAI_ENDPOINT_5 or not Config.OPENAI_API_KEY_5:
-                    print("⚠️ 고성능 엔드포인트 설정이 누락되었습니다. 기본 엔드포인트를 사용합니다.")
+            # 고성능 엔드포인트 우선, 없으면 기본 엔드포인트 사용
+            api_key = Config.OPENAI_API_KEY_5 or Config.OPENAI_API_KEY
+            endpoint = Config.OPENAI_ENDPOINT_5 or Config.OPENAI_ENDPOINT
 
-                return AzureOpenAI(
-                    api_key=Config.OPENAI_API_KEY_5 or Config.OPENAI_API_KEY,
-                    api_version=Config.OPENAI_API_VERSION,
-                    azure_endpoint=Config.OPENAI_ENDPOINT_5 or Config.OPENAI_ENDPOINT
-                )
+            if not api_key or not endpoint:
+                raise ValueError("Azure OpenAI API 키 또는 엔드포인트가 설정되지 않았습니다.")
 
-            # 기본 모델(GPT-4 등)을 위한 표준 엔드포인트
             return AzureOpenAI(
-                api_key=Config.OPENAI_API_KEY,
+                api_key=api_key,
                 api_version=Config.OPENAI_API_VERSION,
-                azure_endpoint=Config.OPENAI_ENDPOINT
+                azure_endpoint=endpoint
             )
 
         return AzureClientFactory._get_from_cache(cache_key, create_client)

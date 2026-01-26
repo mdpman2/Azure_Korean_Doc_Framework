@@ -1,6 +1,21 @@
 # Azure Korean Document Understanding & Retrieval Framework
 
-이 프로젝트는 Azure AI Services (Document Intelligence, OpenAI)를 활용하여 한국어 문서를 정밀하게 분석하고, RAG (Retrieval-Augmented Generation) 시스템을 위한 최적의 청킹(Chunking) 데이터를 생성 및 관리하는 프레임워크입니다.
+이 프로젝트는 Azure AI Services (Document Intelligence, OpenAI GPT-5.2)를 활용하여 한국어 문서를 정밀하게 분석하고, RAG (Retrieval-Augmented Generation) 시스템을 위한 최적의 청킹(Chunking) 데이터를 생성 및 관리하는 프레임워크입니다.
+
+> **📢 2026-01 업데이트**: GPT-5.2, Structured Outputs, Query Rewrite, 향상된 Semantic Ranking 지원
+
+## 🆕 v3.0 주요 업데이트 (2026-01)
+
+| 영역 | 이전 버전 | v3.0 업데이트 |
+|------|----------|--------------|
+| **LLM 모델** | GPT-4.1 | **GPT-5.2** via `model-router` (400K 컨텍스트) |
+| **API 버전** | 2024-08-01-preview | **2024-12-01-preview** (AI Foundry 호환) |
+| **배포 방식** | 직접 배포 | **model-router** (Azure AI Foundry) |
+| **토큰 파라미터** | max_tokens | **max_completion_tokens** (GPT-5.x) |
+| **검색 기능** | Hybrid Search | **Query Rewrite + Semantic Ranking L2** |
+| **응답 형식** | 일반 텍스트 | **Structured Outputs** 지원 |
+| **추론 모델** | 미지원 | **reasoning_effort** 파라미터 지원 |
+| **클라이언트** | 분리 (표준/고급) | **통합 클라이언트** (단일 엔드포인트) |
 
 ## 🌟 핵심 기능: Context-Rich Rolling Window
 
@@ -8,11 +23,11 @@
 
 ### 📄 문서 파싱 (Parsing)
 
-- **구조적 하이브리드 파싱**: Azure Document Intelligence Layout 모델(`prebuilt-layout`)을 사용하여 헤더, 본문, 표, 이미지를 구분합니다.
+- **구조적 하이브리드 파싱**: Azure Document Intelligence Layout 모델(`prebuilt-layout`) v4.0 GA 사용
 - **계층적 문맥 주입**: 모든 청크에 Breadcrumb(상위 목차 경로)를 자동으로 주입하여 검색 품질을 향상시킵니다.
 - **표 독립화 (Table Isolation)**: 표 데이터를 별도의 청크로 격리하여 Markdown 형식으로 구조를 유지합니다.
 - **한국어 특화 청킹**: `kss`를 활용한 한국어 문장 분리 및 의미 단위 분할을 지원합니다.
-- **Visual RAG**: 문서 내 이미지를 GPT-4.1 Vision으로 분석하여 텍스트로 통합합니다.
+- **Visual RAG**: 문서 내 이미지를 **GPT-5.2 Vision**으로 분석하여 텍스트로 통합합니다.
 
 ### 🖼️ 향상된 이미지 분석 (v2.0)
 
@@ -54,7 +69,7 @@
 │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────┐  │
 │  │   parser.py     │───▶│   chunker.py    │───▶│ vector_store│  │
 │  │ (Azure DI +     │    │ (Context-Rich   │    │    .py      │  │
-│  │  GPT-4.1 Vision)│    │  Rolling Window)│    │(Azure Search)│  │
+│  │  GPT-5.2 Vision)│    │  Rolling Window)│    │(Azure Search)│  │
 │  └─────────────────┘    └─────────────────┘    └─────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                                   │
@@ -64,9 +79,41 @@
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────────┐    ┌─────────────────┐                     │
 │  │    agent.py     │◀───│  Azure AI Search │                    │
-│  │  (RAG 로직)      │    │  (Vector Search) │                    │
+│  │  (Query Rewrite │    │  (Hybrid Search) │                    │
+│  │  + RAG 로직)    │    │                  │                    │
 │  └─────────────────┘    └─────────────────┘                     │
 └─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Azure AI Foundry (v3.0)                      │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────┐    ┌─────────────────┐                     │
+│  │  model-router   │    │  Unified Client │                     │
+│  │  (GPT-5.2 라우팅)│◀───│  (단일 엔드포인트)│                    │
+│  └─────────────────┘    └─────────────────┘                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 🔄 모델 라우팅 (v3.0)
+
+```
+사용자 요청 "gpt-5.2"
+        │
+        ▼
+┌───────────────────┐
+│   config.py       │
+│   MODELS 매핑     │
+└───────────────────┘
+        │
+        ▼ gpt-5.2 → model-router
+┌───────────────────┐
+│  model-router     │
+│  (AI Foundry)     │
+└───────────────────┘
+        │
+        ▼
+   GPT-5.2 응답
 ```
 
 ## 🚀 시작하기
@@ -81,19 +128,31 @@ pip install openai azure-ai-documentintelligence azure-search-documents \
 ### 환경 변수 설정 (.env)
 
 ```env
-# Azure OpenAI
-AZURE_OPENAI_API_KEY=your_openai_api_key
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+# Azure AI Foundry 엔드포인트 (GPT-5.2 via model-router)
+# ⚠️ GPT-5.x는 직접 배포가 아닌 model-router를 통해 접근합니다
+OPEN_AI_KEY_5=your_foundry_api_key
+OPEN_AI_ENDPOINT_5=https://your-resource.cognitiveservices.azure.com/
+
+# API 버전 (2024-12-01-preview 권장, 2025-01-01-preview는 일부 엔드포인트에서 미지원)
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
 
-# Azure Document Intelligence
-AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=https://your-resource.cognitiveservices.azure.com/
-AZURE_DOCUMENT_INTELLIGENCE_KEY=your_doc_intel_key
+# 기본 모델 설정
+DEFAULT_MODEL=gpt-5.2          # 기본 답변 모델 (→ model-router로 라우팅)
+VISION_MODEL=gpt-5.2           # 이미지 분석 모델
+PARSING_MODEL=gpt-5.2          # 문서 파싱 모델
+
+# Azure Document Intelligence (v4.0 GA: 2024-11-30)
+AZURE_DI_ENDPOINT=https://your-resource.cognitiveservices.azure.com/
+AZURE_DI_KEY=your_doc_intel_key
 
 # Azure AI Search
-AZURE_SEARCH_SERVICE_ENDPOINT=https://your-search.search.windows.net
+AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
 AZURE_SEARCH_INDEX_NAME=your-index-name
-AZURE_SEARCH_API_KEY=your_search_api_key
+AZURE_SEARCH_KEY=your_search_api_key
+
+# 임베딩 설정
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
 ```
 
 ## 🛠 사용 방법
@@ -141,7 +200,7 @@ python doc_chunk_main.py --skip-ingest --question "늘봄학교란?" --model "gp
 azure_korean_doc_framework1/
 ├── azure_korean_doc_framework/
 │   ├── parsing/
-│   │   ├── parser.py       # Azure DI + GPT-4.1 Vision 하이브리드 파싱
+│   │   ├── parser.py       # Azure DI + GPT-5.2 Vision 하이브리드 파싱
 │   │   └── chunker.py      # Context-Rich Rolling Window 청킹
 │   ├── core/
 │   │   ├── vector_store.py # Azure AI Search 인덱싱/검색
@@ -153,6 +212,7 @@ azure_korean_doc_framework1/
 ├── doc_chunk_main.py       # 통합 실행 스크립트 (CLI)
 ├── doc_chunk_main_only_q.py # Q&A 전용 스크립트
 ├── verify_index.py         # 인덱스 검증 스크립트
+├── test_framework.py       # v3.0 테스트 스위트 (5개 모듈)
 ├── output/                 # 청크 로그 출력 폴더
 ├── .env                    # 환경 변수 설정
 └── README.md
@@ -160,30 +220,54 @@ azure_korean_doc_framework1/
 
 ## 🔧 핵심 모듈 설명
 
-### parser.py (문서 분석)
+### parser.py (문서 분석) - v3.0 업데이트
 
 | 함수 | 설명 |
 |------|------|
-| `parse_pdf()` | PDF를 Azure DI로 분석하여 구조화된 세그먼트 추출 |
-| `_describe_image()` | GPT-4.1 Vision으로 이미지 분석 (유형별 가이드 적용) |
+| `parse_pdf()` | PDF를 Azure DI v4.0으로 분석하여 구조화된 세그먼트 추출 |
+| `_describe_image()` | **GPT-5.2 Vision** (model-router)으로 이미지 분석 |
 | `_extract_context_around_offset()` | 이미지 주변 텍스트 추출로 문맥 파악 |
 | `_enhance_numbered_content()` | 번호 목록 형식 정규화 ("06 제목" → "### 06. 제목") |
+| `is_gpt5` 감지 | GPT-5.x면 `max_completion_tokens` 사용 |
 
-### chunker.py (청킹)
+### agent.py (RAG 에이전트) - v3.0 업데이트
 
 | 함수 | 설명 |
 |------|------|
-| `create_chunks()` | 세그먼트를 Context-Rich 청크로 변환 |
-| `_extract_special_chunks()` | 표/이미지 전용 청크 분리 |
-| `_rolling_window_chunk()` | 문맥 보존 롤링 윈도우 청킹 |
-| `_split_korean_sentences()` | kss 기반 한국어 문장 분리 |
+| `answer_question()` | **GPT-5.2** 기반 RAG 질의응답 (model-router 라우팅) |
+| `_rewrite_query()` | **Query Rewrite** - 의미적 쿼리 확장 (오타 교정, 동의어) |
+| `use_query_rewrite` | Query Rewrite 활성화 옵션 (기본: True) |
+
+### multi_model_manager.py (모델 관리) - v3.0 업데이트
+
+| 함수 | 설명 |
+|------|------|
+| `get_completion()` | GPT-5.x용 **max_completion_tokens**, **reasoning_effort** 지원 |
+| `get_structured_completion()` | **Structured Outputs** JSON 스키마 응답 |
+| `is_gpt5_series()` | GPT-5.x 시리즈 감지 (gpt-5, gpt-5.1, gpt-5.2) |
+
+### azure_clients.py (클라이언트 팩토리) - v3.0.1 신규
+
+| 함수 | 설명 |
+|------|------|
+| `get_openai_client()` | **통합 클라이언트** - 단일 엔드포인트로 모든 요청 처리 |
+| `get_document_intelligence_client()` | Azure DI v4.0 클라이언트 (캐싱) |
+| `get_search_client()` | Azure AI Search 클라이언트 (캐싱) |
+
+### config.py (설정) - v3.0.1 업데이트
+
+| 설정 | 설명 |
+|------|------|
+| `MODELS` | 모델명 → 배포명 매핑 (`gpt-5.2` → `model-router`) |
+| `ADVANCED_MODELS` | **frozenset** - O(1) 고성능 모델 조회 |
+| `REASONING_MODELS` | **frozenset** - O(1) 추론 모델 조회 |
 
 ### vector_store.py (벡터 저장소)
 
 | 함수 | 설명 |
 |------|------|
 | `upload_documents()` | 청크를 Azure AI Search에 업로드 |
-| `hybrid_search()` | 키워드 + 벡터 하이브리드 검색 |
+| `hybrid_search()` | 키워드 + 벡터 하이브리드 검색 + **Semantic Ranking L2** |
 | `ensure_index_exists()` | 인덱스 자동 생성/검증 |
 
 ## 📈 청크 메타데이터
@@ -216,9 +300,49 @@ azure_korean_doc_framework1/
 
 - Python 3.9+
 - Azure 구독 및 다음 서비스:
-  - Azure OpenAI (GPT-4.1, text-embedding-3-small)
-  - Azure Document Intelligence
-  - Azure AI Search
+  - **Azure AI Foundry** (GPT-5.2 via model-router, text-embedding-3-small)
+    - API 버전: `2024-12-01-preview`
+  - **Azure Document Intelligence** v4.0 GA (2024-11-30)
+  - **Azure AI Search** (Semantic Ranking 활성화 권장)
+
+### 🧪 테스트 실행
+
+```bash
+# 전체 모듈 테스트 (5개 모듈)
+python test_framework.py
+
+# Q&A 통합 테스트
+python doc_chunk_main_only_q.py --question "테스트 질문" --model "gpt-5.2"
+```
+
+## 🔄 변경 이력
+
+### v3.0.1 (2026-01-26) - 최신
+- ✅ **model-router 배포 방식** 지원 (Azure AI Foundry)
+  - GPT-5.x는 직접 배포가 아닌 `model-router`를 통해 접근
+  - `config.py`에서 자동 라우팅: `gpt-5.2` → `model-router`
+- ✅ **통합 클라이언트** 아키텍처
+  - 표준/고급 클라이언트 분리 제거
+  - 단일 엔드포인트로 모든 요청 처리 (인증 간소화)
+- ✅ **API 버전 수정**: `2024-12-01-preview` (호환성 개선)
+- ✅ **frozenset 최적화**: `ADVANCED_MODELS`, `REASONING_MODELS`
+  - 모델 조회 O(1) 성능 보장
+- ✅ **test_framework.py** 추가
+  - 5개 모듈 자동 테스트 (Config, Clients, Manager, Parser, Agent)
+  - GPT-5.2 API 연결 테스트 포함
+
+### v3.0 (2026-01-25)
+- ✅ **GPT-5.2** 기본 모델로 전환 (Vision + Reasoning 통합)
+- ✅ **max_completion_tokens** 파라미터 지원 (GPT-5.x 전용)
+- ✅ **Structured Outputs** 지원 (`get_structured_completion()`)
+- ✅ **Query Rewrite** 기능 추가 (의미적 쿼리 확장)
+- ✅ **reasoning_effort** 파라미터 지원 (low/medium/high)
+- ✅ 고성능 모델 목록 확장 (o3, o4-mini 추가)
+
+### v2.0
+- 이미지 유형별 분석 가이드
+- 표 전용 청크 분리
+- 번호 목록 처리 개선
 
 ## 📜 라이선스
 
@@ -228,3 +352,4 @@ MIT License
 
 - [Korean_Doc_Chunking_Azure](../Korean_Doc_Chunking_Azure) - 이전 버전
 - [azure_search_foundry_agent.py](../azure_search_foundry_agent.py) - Foundry Agent 통합 버전
+- [advanced_text_to_sql](../advanced_text_to_sql) - GPT-5.2 Text-to-SQL 에이전트
