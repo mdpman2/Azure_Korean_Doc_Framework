@@ -1,3 +1,15 @@
+"""
+azure_korean_doc_framework v4.0 통합 CLI 실행 스크립트
+
+문서 파싱 → 청킹 → 인덱싱 → Q&A 테스트를 통합 실행합니다.
+변경 감지 인덱싱, 병렬 처리, Graph RAG, 엔티티 추출 등을 지원합니다.
+
+Usage:
+  python doc_chunk_main.py --path "RAG_TEST_DATA"
+  python doc_chunk_main.py --path "data" --graph-rag --extract-entities
+  python doc_chunk_main.py --skip-ingest -q "질문" --model gpt-5.2
+"""
+
 import os
 import json
 import argparse

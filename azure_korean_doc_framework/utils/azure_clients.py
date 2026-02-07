@@ -1,3 +1,10 @@
+"""
+Azure 서비스 클라이언트 팩토리 모듈
+
+Azure OpenAI, Document Intelligence, AI Search 클라이언트를
+생성하고 캐싱하여 불필요한 인스턴스 재생성을 방지합니다.
+"""
+
 from openai import AzureOpenAI
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential

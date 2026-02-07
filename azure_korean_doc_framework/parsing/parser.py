@@ -13,11 +13,14 @@ class HybridDocumentParser:
     다양한 문서 형식(PDF, PPTX, DOCX)을 처리하여 구조화된 세그먼트를 추출하는 파서.
     Azure Document Intelligence(Layout Model) + GPT-5.2(Vision + Reasoning)를 결합하여 사용.
 
-    [2026-01 업데이트]
+    [2026-01 v3.0 업데이트]
     - GPT-5.2 Vision 사용 (향상된 이미지 분석)
     - Structured Outputs 지원
     - max_completion_tokens 파라미터 사용
     - 향상된 한국어 OCR 지원
+
+    [2026-07 v4.0.1 최적화]
+    - import re 모듈 최상단 이동
     """
 
     def __init__(self, vision_model: str = None):

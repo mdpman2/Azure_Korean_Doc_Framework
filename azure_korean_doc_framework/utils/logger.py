@@ -15,7 +15,7 @@ class ChunkLogger:
         주어진 청크 리스트를 JSON 파일로 저장합니다.
 
         Args:
-            chunks (List[Document]): 저장할 LangChain Document 객체 리스트
+            chunks (List[Document]): 저장할 Document 객체 리스트 (core.schema.Document)
             filename (str): 원본 파일명 (이 이름을 기반으로 로그 파일명이 생성됨)
             output_dir (str): 저장할 디렉토리 경로 (기본값: "output")
         """
