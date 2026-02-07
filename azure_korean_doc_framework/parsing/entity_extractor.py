@@ -11,7 +11,7 @@ Google LangExtract(https://github.com/google/langextract)의 핵심 개념을 �
 - Source Grounding (원문 위치 추적)
 - 병렬 처리 지원
 
-[2026-07 v4.0 신규]
+[2026-02 v4.0 신규]
 - LangExtract 기반 구조화 추출 아키텍처
 - 한국어 Unicode 토크나이저
 - 원문 위치 추적 (char_interval)

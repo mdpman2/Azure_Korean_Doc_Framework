@@ -9,7 +9,7 @@ class Config:
     프레임워크의 모든 설정을 관리하는 중앙 구성 클래스입니다.
     환경 변수(.env)에서 설정값을 읽어옵니다.
 
-    [2026-07 v4.0 업데이트]
+    [2026-02 v4.0 업데이트]
     - Graph RAG 지원 (LightRAG 기반 Knowledge Graph)
     - 구조화 엔티티 추출 (LangExtract 기반)
     - GPT-5.2 기본 모델 (Vision + Reasoning 통합)

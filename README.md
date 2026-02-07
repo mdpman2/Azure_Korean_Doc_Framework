@@ -2,9 +2,9 @@
 
 이 프로젝트는 Azure AI Services (Document Intelligence, OpenAI GPT-5.2)를 활용하여 한국어 문서를 정밀하게 분석하고, RAG (Retrieval-Augmented Generation) 시스템을 위한 최적의 청킹(Chunking) 데이터를 생성 및 관리하는 프레임워크입니다.
 
-> **📢 2026-07 v4.0 업데이트**: Graph RAG (LightRAG 기반), 구조화 엔티티 추출 (LangExtract 기반), 한국어 Unicode 토크나이저
+> **📢 2026-02 v4.0 업데이트**: Graph RAG (LightRAG 기반), 구조화 엔티티 추출 (LangExtract 기반), 한국어 Unicode 토크나이저
 
-## 🆕 v4.0 주요 업데이트 (2026-07)
+## 🆕 v4.0 주요 업데이트 (2026-02)
 
 | 영역 | v3.0.1 | v4.0 업데이트 |
 |------|--------|--------------|
@@ -443,7 +443,7 @@ python doc_chunk_main.py --path "RAG_TEST_DATA" --graph-rag --graph-mode hybrid
 
 ## 🔄 변경 이력
 
-### v4.0 (2026-07) - 최신
+### v4.0 (2026-02)
 - ✅ **Graph RAG** (LightRAG 기반 Knowledge Graph)
   - GPT-5.2 기반 한국어 엔티티/관계 자동 추출
   - NetworkX 인메모리 Knowledge Graph 구축
@@ -462,7 +462,7 @@ python doc_chunk_main.py --path "RAG_TEST_DATA" --graph-rag --graph-mode hybrid
 - ✅ **config.py** Graph RAG / 추출 설정 추가
 - ✅ **doc_chunk_main.py** CLI 옵션 확장 (`--graph-rag`, `--graph-mode`, `--extract-entities`)
 
-### v4.0.1 (2026-07) - 코드 최적화
+### v4.0.1 (2026-02) - 코드 최적화
 - ✅ 시스템 프롬프트 DRY 리팩토링 (`_RAG_SYSTEM_PROMPT` / `_GRAPH_RAG_SYSTEM_PROMPT` 모듈 상수)
 - ✅ Dead code 제거 (`GPT_4O_DEPLOYMENT_NAME`, 주석 처리된 import, 빈 pass 블록)
 - ✅ `import re` 모듈 최상단 이동 (parser.py)

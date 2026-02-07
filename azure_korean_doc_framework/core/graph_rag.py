@@ -10,7 +10,7 @@ LightRAG(https://github.com/HKUDS/LightRAG)의 핵심 개념을 참조하여 구
 - Dual-Level Retrieval (Local: 엔티티 중심, Global: 관계 중심)
 - 벡터 검색과 그래프 검색의 하이브리드 결합
 
-[2026-07 v4.0 신규]
+[2026-02 v4.0 신규]
 - LightRAG 기반 Graph RAG 아키텍처
 - 한국어 엔티티 타입 특화
 - Azure AI Search + Knowledge Graph 하이브리드

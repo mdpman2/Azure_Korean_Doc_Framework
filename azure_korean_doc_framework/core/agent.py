@@ -28,7 +28,7 @@ class KoreanDocAgent:
     Azure AI Search의 Hybrid Search + Semantic Ranking을 활용하여 문맥을 찾고,
     GPT-5.2를 통해 지능적인 답변을 생성합니다.
 
-    [2026-07 v4.0 업데이트]
+    [2026-02 v4.0 업데이트]
     - Graph-Enhanced RAG (LightRAG 기반 Knowledge Graph 연동)
     - 구조화 엔티티 추출 결과 활용 (LangExtract 기반)
     - GPT-5.2 기본 모델 사용

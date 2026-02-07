@@ -19,7 +19,7 @@ class HybridDocumentParser:
     - max_completion_tokens 파라미터 사용
     - 향상된 한국어 OCR 지원
 
-    [2026-07 v4.0.1 최적화]
+    [2026-02 v4.0.1 최적화]
     - import re 모듈 최상단 이동
     """
 

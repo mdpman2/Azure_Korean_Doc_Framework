@@ -4,7 +4,7 @@ Context-Rich Rolling Window 청킹 모듈
 문서의 구조(Hierarchy)와 문맥(Context)을 보존하는 적응형 청킹 시스템.
 kss 한국어 문장 분리 + tiktoken 토큰 기반 분할.
 
-[2026-07 v4.0 업데이트]
+[2026-02 v4.0 업데이트]
 - 엔티티 인식 메타데이터 (hangul_ratio, graph_rag_eligible)
 - 한글 비율 계산 (사전 컴파일된 _HANGUL_SYLLABLE_RE)
 - _enrich_metadata(): Graph RAG 적격 여부 태깅
