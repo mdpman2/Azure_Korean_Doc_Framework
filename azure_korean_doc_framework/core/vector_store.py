@@ -16,7 +16,7 @@ from azure.search.documents.indexes.models import (
 from ..utils.azure_clients import AzureClientFactory
 from ..config import Config
 from .schema import Document
-# from langchain_openai import AzureOpenAIEmbeddings # Removed
+
 
 class VectorStore:
     """
@@ -117,10 +117,6 @@ class VectorStore:
                 print(f"🛠️ 'content_hash' 필드 추가 중: {self.index_name}")
                 index.fields.append(SimpleField(name="content_hash", type=SearchFieldDataType.String, filterable=True))
                 updated = True
-
-            if "parent_id" in field_names:
-                # parent_id를 facetable로 변경 시도 (기본적으로 교체는 인덱스 재생성 필요할 수 있음)
-                pass
 
             # 시맨틱 검색 설정 확인 및 추가
             if not index.semantic_search or not any(c.name == "my-semantic-config" for c in index.semantic_search.configurations):

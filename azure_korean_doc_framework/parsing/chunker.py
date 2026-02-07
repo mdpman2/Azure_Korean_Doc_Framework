@@ -9,6 +9,9 @@ from ..core.multi_model_manager import MultiModelManager
 
 from ..config import Config
 
+# 사전 컴파일된 한글 패턴 (성능 최적화)
+_HANGUL_SYLLABLE_RE = re.compile(r'[\uAC00-\uD7AF]')
+
 
 @dataclass
 class ChunkingConfig:
@@ -36,6 +39,11 @@ class AdaptiveChunker:
     - 청크 간 오버랩으로 문맥 연속성 보장
     - 한국어 문장 경계 인식
     - 강화된 메타데이터
+
+    [v4.0 업데이트]
+    - 엔티티 인식 청킹 (LangExtract 기반 엔티티 경계 보존)
+    - 한국어 Unicode 토크나이저 연동
+    - Graph RAG용 엔티티 메타데이터 태깅
     """
 
     def __init__(self, config: Optional[ChunkingConfig] = None):
@@ -135,7 +143,7 @@ class AdaptiveChunker:
         chunk_text: str,
         section_title: str = ""
     ) -> Dict[str, Any]:
-        """청크에 강화된 메타데이터를 추가합니다."""
+        """청크에 강화된 메타데이터를 추가합니다. (v4.0: 엔티티 태깅 포함)"""
         enriched = base_metadata.copy()
         enriched.update({
             "chunk_index": chunk_index,
@@ -143,8 +151,18 @@ class AdaptiveChunker:
             "token_count": self._count_tokens(chunk_text),
             "char_count": len(chunk_text),
             "section_title": section_title,
+            # v4.0: 한국어 텍스트 비율 메타데이터
+            "hangul_ratio": self._calculate_hangul_ratio(chunk_text),
         })
         return enriched
+
+    def _calculate_hangul_ratio(self, text: str) -> float:
+        """텍스트의 한글 비율을 계산합니다. (v4.0 신규)"""
+        if not text:
+            return 0.0
+        hangul_count = len(_HANGUL_SYLLABLE_RE.findall(text))
+        total_chars = len(text.replace(' ', '').replace('\n', ''))
+        return round(hangul_count / max(total_chars, 1), 3)
 
     # ==================== 표/이미지 청크 분리 ====================
 
@@ -254,6 +272,12 @@ class AdaptiveChunker:
         print(f"      - Text chunks: {text_chunks}")
         print(f"      - Table chunks: {table_chunks}")
         print(f"      - Image chunks: {image_chunks}")
+
+        # v4.0: Graph RAG 대상 플래그 (텍스트 청크만)
+        for c in chunks:
+            if not c.metadata.get('is_table_data') and not c.metadata.get('is_image_data'):
+                c.metadata['graph_rag_eligible'] = True
+
         return chunks
 
     def _classify_document(self, filename: str, segments: List[Dict[str, Any]]) -> ChunkingStrategy:

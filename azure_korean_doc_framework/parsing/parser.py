@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 from io import BytesIO
 from typing import List, Dict, Any, Optional, Tuple
@@ -111,7 +112,6 @@ class HybridDocumentParser:
 
     def _enhance_numbered_content(self, content: str, role: str = None) -> Tuple[str, str]:
         """번호 목록 형식을 개선하고 유형을 반환합니다."""
-        import re
 
         # "06 제목" 또는 "06. 제목" 형식 감지
         numbered_pattern = r'^(\d{2})\.?\s+(.+)$'

@@ -9,11 +9,12 @@ class Config:
     프레임워크의 모든 설정을 관리하는 중앙 구성 클래스입니다.
     환경 변수(.env)에서 설정값을 읽어옵니다.
 
-    [2026-01 업데이트]
-    - GPT-5.2 기본 모델로 전환 (Vision + Reasoning 통합)
-    - API Version: v1 (GA) 또는 2025-01-01-preview
-    - Structured Outputs 지원
-    - max_completion_tokens 파라미터 사용
+    [2026-07 v4.0 업데이트]
+    - Graph RAG 지원 (LightRAG 기반 Knowledge Graph)
+    - 구조화 엔티티 추출 (LangExtract 기반)
+    - GPT-5.2 기본 모델 (Vision + Reasoning 통합)
+    - API Version: 2024-12-01-preview
+    - Structured Outputs / max_completion_tokens 지원
     - Document Intelligence API: 2024-11-30 (GA)
     """
 
@@ -97,9 +98,6 @@ class Config:
     # 임베딩 차원 (text-embedding-3-small: 1536, large: 3072)
     EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
 
-    # Contextual Retrieval용 모델
-    GPT_4O_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_GPT4O_DEPLOYMENT", "gpt-5.2")
-
     # Azure Document Intelligence 설정
     DI_KEY = os.getenv("AZURE_DI_KEY")
     DI_ENDPOINT = os.getenv("AZURE_DI_ENDPOINT")
@@ -110,19 +108,41 @@ class Config:
     # 현재 활성화된 인덱스명 (환경 변수보다 이 파일의 설정을 우선시하도록 수정)
     SEARCH_INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME", "")
 
+    # =================================================================
+    # Graph RAG 설정 (v4.0 신규 - LightRAG 기반)
+    # =================================================================
+
+    # Graph RAG 활성화 여부
+    GRAPH_RAG_ENABLED = os.getenv("GRAPH_RAG_ENABLED", "true").lower() == "true"
+
+    # Knowledge Graph 저장 경로
+    GRAPH_STORAGE_PATH = os.getenv("GRAPH_STORAGE_PATH", "output/knowledge_graph.json")
+
+    # 엔티티 추출 배치 크기
+    GRAPH_ENTITY_BATCH_SIZE = int(os.getenv("GRAPH_ENTITY_BATCH_SIZE", "5"))
+
+    # 그래프 검색 모드 (local, global, hybrid, naive)
+    GRAPH_QUERY_MODE = os.getenv("GRAPH_QUERY_MODE", "hybrid")
+
+    # 그래프 검색 top_k
+    GRAPH_TOP_K = int(os.getenv("GRAPH_TOP_K", "10"))
+
+    # =================================================================
+    # 구조화 추출 설정 (v4.0 신규 - LangExtract 기반)
+    # =================================================================
+
+    # 추출 패스 수 (Multi-Pass Extraction, 높을수록 Recall 향상)
+    EXTRACTION_PASSES = int(os.getenv("EXTRACTION_PASSES", "1"))
+
+    # 추출용 청크 최대 문자 수
+    EXTRACTION_MAX_CHUNK_CHARS = int(os.getenv("EXTRACTION_MAX_CHUNK_CHARS", "3000"))
+
+    # 병렬 추출 워커 수
+    EXTRACTION_MAX_WORKERS = int(os.getenv("EXTRACTION_MAX_WORKERS", "4"))
+
     @classmethod
     def validate(cls):
         """필수 환경 변수가 설정되어 있는지 확인합니다."""
-        required_vars = [
-            "AZURE_OPENAI_API_KEY",
-            "AZURE_OPENAI_ENDPOINT",
-            "AZURE_DI_KEY",
-            "DI_ENDPOINT", # .env에는 AZURE_DI_ENDPOINT로 되어 있을 수 있으므로 체크 필요
-            "AZURE_SEARCH_KEY",
-            "AZURE_SEARCH_ENDPOINT"
-        ]
-
-        # 실제 로직에서는 .env의 변수명과 Config 클래스의 속성 이름을 매칭해서 체크
         missing = []
         if not cls.OPENAI_API_KEY: missing.append("AZURE_OPENAI_API_KEY")
         if not cls.OPENAI_ENDPOINT: missing.append("AZURE_OPENAI_ENDPOINT")

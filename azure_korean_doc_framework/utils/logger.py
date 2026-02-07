@@ -27,12 +27,10 @@ class ChunkLogger:
             json_filename = f"{safe_filename}_chunks.json"
             json_path = os.path.join(output_dir, json_filename)
 
-            chunks_data = []
-            for c in chunks:
-                chunks_data.append({
-                    "page_content": c.page_content,
-                    "metadata": c.metadata
-                })
+            chunks_data = [
+                {"page_content": c.page_content, "metadata": c.metadata}
+                for c in chunks
+            ]
 
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(chunks_data, f, ensure_ascii=False, indent=2)

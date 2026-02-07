@@ -1,0 +1,21 @@
+# azure_korean_doc_framework v4.0 — 의존성 패키지
+# 설치: pip install -r requirements.txt
+
+# ===== Azure SDK =====
+openai>=1.109.0
+azure-ai-documentintelligence>=1.0.0
+azure-search-documents>=11.6.0
+
+# ===== 문서 처리 =====
+pymupdf>=1.26.0
+pillow>=12.0.0
+tiktoken>=0.12.0
+
+# ===== 한국어 NLP =====
+kss>=6.0.0
+
+# ===== Graph RAG (v4.0) =====
+networkx>=3.4
+
+# ===== 유틸리티 =====
+python-dotenv>=1.0.0

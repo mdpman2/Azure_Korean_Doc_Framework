@@ -1,4 +1,5 @@
 import os
+import json
 import argparse
 import glob
 import hashlib
@@ -11,6 +12,20 @@ from azure_korean_doc_framework.core.vector_store import VectorStore
 from azure_korean_doc_framework.core.agent import KoreanDocAgent
 from azure_korean_doc_framework.config import Config
 from azure_korean_doc_framework.utils.logger import ChunkLogger
+
+# v4.0: Graph RAG & 구조화 추출
+try:
+    from azure_korean_doc_framework.core.graph_rag import KnowledgeGraphManager, QueryMode
+    HAS_GRAPH_RAG = True
+except ImportError:
+    HAS_GRAPH_RAG = False
+    print("⚠️ Graph RAG 비활성화 (networkx 패키지 필요: pip install networkx)")
+
+try:
+    from azure_korean_doc_framework.parsing.entity_extractor import StructuredEntityExtractor
+    HAS_ENTITY_EXTRACTOR = True
+except ImportError:
+    HAS_ENTITY_EXTRACTOR = False
 
 def calculate_file_hash(file_path: str) -> str:
     """파일의 SHA256 해시를 계산하여 내용 변경 여부를 정확히 판단합니다."""
@@ -172,6 +187,30 @@ def main():
         default="gpt-5.2",
         help="Q&A에 사용할 모델 (기본값: gpt-5.2)"
     )
+    # v4.0: Graph RAG 옵션
+    arg_parser.add_argument(
+        "--graph-rag",
+        action="store_true",
+        help="[v4.0] Graph RAG 활성화 (LightRAG 기반 Knowledge Graph 구축 및 검색)"
+    )
+    arg_parser.add_argument(
+        "--graph-mode",
+        type=str,
+        default="hybrid",
+        choices=["local", "global", "hybrid", "naive"],
+        help="[v4.0] Graph 검색 모드 (기본값: hybrid)"
+    )
+    arg_parser.add_argument(
+        "--extract-entities",
+        action="store_true",
+        help="[v4.0] LangExtract 기반 구조화 엔티티 추출 수행"
+    )
+    arg_parser.add_argument(
+        "--graph-save",
+        type=str,
+        default="output/knowledge_graph.json",
+        help="[v4.0] Knowledge Graph 저장 경로"
+    )
 
     args = arg_parser.parse_args()
 
@@ -204,10 +243,90 @@ def main():
             else:
                 print(f"⚠️ 경로를 찾을 수 없습니다: {target_path}")
 
+    # 2.5 [v4.0] Graph RAG 구축 (--graph-rag 옵션)
+    graph_manager = None
+    if args.graph_rag and HAS_GRAPH_RAG:
+        print("\n--- [Graph RAG: Knowledge Graph 구축] ---")
+        graph_manager = KnowledgeGraphManager(model_key=args.model)
+
+        # 기존 그래프 로드 시도
+        graph_path = args.graph_save
+        if os.path.exists(graph_path):
+            graph_manager.load_graph(graph_path)
+            print(f"📁 기존 Knowledge Graph 로드 완료")
+
+        # 새로운 청크가 있으면 그래프 구축
+        if not args.skip_ingest:
+            chunk_files = glob.glob("output/*_chunks.json")
+            if chunk_files:
+                all_chunk_texts = []
+                for cf in chunk_files:
+                    with open(cf, 'r', encoding='utf-8') as f:
+                        chunks_data = json.load(f)
+                    for c in chunks_data:
+                        if not c.get('metadata', {}).get('is_table_data'):
+                            all_chunk_texts.append({"page_content": c.get('page_content', '')})
+
+                if all_chunk_texts:
+                    print(f"🔍 {len(all_chunk_texts)}개 텍스트 청크에서 엔티티/관계 추출 중...")
+                    graph_manager.extract_from_chunks(
+                        all_chunk_texts,
+                        batch_size=Config.GRAPH_ENTITY_BATCH_SIZE,
+                    )
+                    # 그래프 저장
+                    os.makedirs(os.path.dirname(graph_path) or '.', exist_ok=True)
+                    graph_manager.save_graph(graph_path)
+
+        stats = graph_manager.get_stats()
+        print(f"📊 Knowledge Graph 통계: 노드 {stats['nodes']}개, 엣지 {stats['edges']}개")
+        if stats.get('entity_types'):
+            for et, count in stats['entity_types'].items():
+                print(f"   - {et}: {count}개")
+
+    # 2.6 [v4.0] 구조화 엔티티 추출 (--extract-entities 옵션)
+    if args.extract_entities and HAS_ENTITY_EXTRACTOR:
+        print("\n--- [v4.0: 구조화 엔티티 추출 (LangExtract 기반)] ---")
+        extractor = StructuredEntityExtractor(
+            model_key=args.model,
+            extraction_passes=Config.EXTRACTION_PASSES,
+            max_chunk_chars=Config.EXTRACTION_MAX_CHUNK_CHARS,
+            max_workers=Config.EXTRACTION_MAX_WORKERS,
+        )
+
+        chunk_files = glob.glob("output/*_chunks.json")
+        for cf in chunk_files:
+            with open(cf, 'r', encoding='utf-8') as f:
+                chunks_data = json.load(f)
+
+            texts = [c.get('page_content', '') for c in chunks_data if c.get('page_content')]
+            full_text = "\n\n".join(texts[:20])  # 상위 20개 청크만
+
+            result = extractor.extract(full_text)
+            output_path = cf.replace('_chunks.json', '_entities.json')
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(extractor.extractions_to_dict(result), f, ensure_ascii=False, indent=2)
+            print(f"   ✅ {os.path.basename(cf)}: {len(result.extractions)}개 엔티티 추출 → {output_path}")
+
     # 3. Q&A 테스트
     if not args.skip_qa:
         models_to_test = [args.model]
-        perform_qa_test(args.question, models_to_test)
+
+        # v4.0: Graph RAG가 활성화되면 graph_enhanced_answer 사용
+        if graph_manager and graph_manager.graph.number_of_nodes() > 0:
+            print("\n--- [2단계: Graph-Enhanced Q&A 테스트] ---")
+            agent = KoreanDocAgent(graph_manager=graph_manager)
+            print(f"질문: {args.question}")
+            for model in models_to_test:
+                print(f"\n--- 모델: {model} (Graph-Enhanced, mode={args.graph_mode}) ---")
+                answer = agent.graph_enhanced_answer(
+                    args.question,
+                    model_key=model,
+                    top_k=5,
+                    graph_query_mode=args.graph_mode,
+                )
+                print(f"답변:\n{answer}")
+        else:
+            perform_qa_test(args.question, models_to_test)
 
 if __name__ == "__main__":
     main()
