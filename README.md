@@ -4,21 +4,33 @@
 
 > **📢 2026-03 문서 정리**: Azure AI Search 필드 매핑, 출처 표기, 시맨틱 설정명이 현재 코드와 실제 검증 결과에 맞게 갱신되었습니다.
 
-> **📢 2026-02 v4.1 업데이트**: Contextual Retrieval (Anthropic 방식) + Hybrid Search (BM25 + Vector + Semantic Ranking)
+> **📢 최신 기능 요약**
+> - `v4.1`: Contextual Retrieval + Hybrid Search
+> - `v4.2`: Guardrails + Evidence Extraction + Quality Evaluation
+> - `v4.3`: 외부 Azure AI Search 인덱스 재사용, 출처 복원, 라이브 재색인 검증
 
-## 🆕 v4.1 주요 업데이트 (2026-02)
+## 🆕 최근 주요 업데이트
 
-| 영역 | v4.0 | v4.1 업데이트 |
-|------|--------|---------------|
-| **검색 방식** | Hybrid Search + Semantic Ranking | **Contextual Retrieval** (BM25 + Vector + Semantic Ranking) |
-| **맥락 추가** | Legal 전략만 부분 적용 | **모든 청크에 LLM 기반 맥락 자동 추가** (Anthropic 방식) |
-| **BM25 검색** | 일반 키워드 검색 | **Contextual BM25** (맥락 포함된 텍스트로 BM25 검색) |
-| **벡터 검색** | 일반 임베딩 | **Contextual Embeddings** (맥락 포함된 텍스트로 임베딩) |
-| **검색 결합** | 단순 RRF | **BM25 + Vector + Semantic Ranker** 3단계 결합 |
-| **답변 생성** | 맥락 포함 텍스트 사용 | **원본 텍스트로 답변 생성** (깨끗한 컨텍스트) |
-| **Knowledge Graph** | LightRAG 기반 KG | LightRAG 기반 KG (유지) |
+| 버전 | 핵심 추가 내용 | 운영 관점 효과 |
+|------|----------------|----------------|
+| **v4.1** | Contextual Retrieval, Contextual BM25, Contextual Embeddings, Hybrid Search | 검색 실패율 감소, 원본 텍스트 기반 답변 |
+| **v4.2** | Retrieval Gate, Question Classification, Evidence Extraction, Numeric Verification, PII/Injection/Faithfulness/Hallucination Guardrails, Batch Evaluation | 저품질 검색 차단, 규정형 답변 안정화, 운영 안전장치 강화 |
+| **v4.3** | Azure AI Search 필드 매핑, semantic config 매핑, evidence 답변 출처 복원, 기존 인덱스 재사용, 라이브 재색인 검증 | 외부 인덱스 호환성 확보, 실제 운영 인덱스에 안전하게 연결 |
 
 ## 🌟 핵심 기능
+
+### 🛡️ Guardrails + Evaluation (v4.2 신규)
+
+검색이 된다고 바로 답변하지 않고, 검색 품질과 답변 안전성을 점검한 뒤 응답하는 운영형 RAG 파이프라인입니다.
+
+- **Retrieval Quality Gate**: 검색 점수와 문서 수가 기준 미달이면 답변 생성을 차단하거나 soft-fail 처리
+- **Question Classification**: extraction / regulatory / explanatory 유형을 구분해 처리 경로 최적화
+- **Evidence Extraction + Exact Citation**: 규정형 질문에 대해 근거 문장을 먼저 추출하고, 최종 답변에 출처를 복원
+- **Numeric Verification**: 답변의 숫자, 기간, 횟수가 실제 검색 문맥에 존재하는지 검증
+- **PII Masking**: 이메일, 휴대전화, 주민등록번호 등 민감정보 자동 마스킹
+- **Prompt Injection Detection**: 명시적 패턴과 LLM 판정으로 위험 질의 차단
+- **Faithfulness / Hallucination Check**: 생성 답변의 충실도와 비근거 주장 여부 후검증
+- **Batch Quality Evaluation**: JSON/TSV 데이터셋을 사용해 평균 점수와 질문별 평가 사유를 저장
 
 ### 🧠 Contextual Retrieval (v4.1 신규 - Anthropic 방식)
 
@@ -109,17 +121,21 @@
 - **Graph-Enhanced RAG** (v4.0): 벡터 검색 + Knowledge Graph 결합으로 정확도 향상
 - **Contextual Retrieval** (v4.1): Anthropic 방식 맥락 추가로 검색 실패율 49% 감소
 - **Hybrid Search** (v4.1): BM25 키워드 + Vector 유사성 + Semantic Ranking 3단계 결합
+- **Guardrails Orchestration** (v4.2): 검색 게이트, 숫자 검증, PII 마스킹, injection/faithfulness/hallucination 검사
+- **Evidence-Based Answers** (v4.2): 규정형 질문에서 근거 우선 추출 후 답변 + 출처 복원
+- **Batch Evaluation** (v4.2): `run_quality_evaluation.py`로 질문별 점수와 평균 점수 산출
+- **Search Field Mapping** (v4.3): 기존 Azure AI Search 인덱스의 `id`, `content`, `title`, `parent_id`, `content_vector` 구조 재사용 가능
 - **고성능 병렬 처리**: 다중 코어를 활용하여 대량의 문서를 빠르게 인덱싱 (`--workers` 옵션)
 - **변경 감지 인덱싱**: 파일 해시 비교를 통한 선택적 처리
-- **멀티 모델 평가**: 동일 질문에 대해 다양한 모델의 답변 비교 테스트
+- **라이브 운영 검증 완료**: `idx-hr-handson` 인덱스에 실제 재색인 후 질의응답 검증
 - **유형별 청크 통계**: 처리 완료 시 텍스트/표/이미지 청크 수 분류 표시
 
-## 🏗️ 아키텍처 (v4.1)
+## 🏗️ 아키텍처 (v4.2+)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        doc_chunk_main.py                        │
-│          (CLI 통합 실행 + Contextual Retrieval + Graph RAG)       │
+│   (CLI 통합 실행 + Contextual Retrieval + Graph RAG + Guardrails) │
 └─────────────────────────────────────────────────────────────────┘
                                   │
                     ┌─────────────┼─────────────┐
@@ -140,14 +156,17 @@
                     │             │              │
                     ▼             ▼              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│             Q&A / Hybrid Search + Graph RAG                     │
+│       Q&A / Hybrid Search + Graph RAG + Guardrails              │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────────┐    ┌───────────────────────────┐            │
 │  │    agent.py     │    │ Azure AI Search           │            │
 │  │  (Query Rewrite │◀───│ BM25 + Vector + Semantic  │            │
 │  │  + Graph RAG    │    │ (Contextual Retrieval)    │            │
 │  │  + Hybrid Search│    │ + KG Context              │            │
+│  │  + Guardrails)  │    │ + Existing Index Mapping  │            │
 │  └─────────────────┘    └───────────────────────────┘            │
+│             │                                                    │
+│             └── retrieval_gate / evidence / verification         │
 └─────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -398,7 +417,7 @@ python doc_chunk_main.py --skip-ingest --question "늘봄학교란?" --model "gp
 📋 엔티티 추출 완료: 38개 엔티티 (인물 12, 조직 8, 정책 6, ...)
 ```
 
-## 📂 프로젝트 구조 (v4.1)
+## 📂 프로젝트 구조 (v4.2+)
 
 ```
 azure_korean_doc_framework1/
@@ -465,7 +484,7 @@ azure_korean_doc_framework1/
 | `KoreanUnicodeTokenizer` | 한국어/CJK Unicode 토크나이저 |
 | `ExampleData` / `Extraction` | Few-Shot 예시 및 추출 결과 데이터 모델 |
 
-### agent.py (RAG 에이전트) - v4.1 업데이트
+### agent.py (RAG 에이전트) - v4.2 업데이트
 
 | 함수/상수 | 설명 |
 |----------|------|
@@ -531,7 +550,7 @@ python run_guardrail_scenarios.py
 | `_split_korean_sentences()` | kss + 정규식 한국어 문장 분리 |
 | `_merge_sentences_to_chunks()` | 오버랩 적용 청크 병합 |
 
-### config.py (설정) - v4.1 업데이트
+### config.py (설정) - v4.2 업데이트
 
 | 설정 | 설명 |
 |------|------|
@@ -556,7 +575,7 @@ python run_guardrail_scenarios.py
 | `_ensure_incremental_fields()` | 기존 인덱스에 parent/original/semantic 설정 보정 |
 | `delete_documents_by_parent_id()` | 부모 문서 기준 증분 삭제 |
 
-## 📈 청크 메타데이터 (v4.1)
+## 📈 청크 메타데이터 (v4.1+)
 
 각 청크에는 다음 메타데이터가 포함됩니다:
 
