@@ -9,27 +9,36 @@ class Config:
     프레임워크의 모든 설정을 관리하는 중앙 구성 클래스입니다.
     환경 변수(.env)에서 설정값을 읽어옵니다.
 
-    [2026-02 v4.0 업데이트]
+    [2026-02 v4.1 업데이트]
+    - Contextual Retrieval (Anthropic 방식) — 청크별 LLM 맥락 생성
+    - Hybrid Search: BM25 키워드 + Vector 유사성 + Semantic Ranking 결합
+    - Contextual BM25 / Contextual Embeddings 지원
+
+    [2026-03 v4.3]
+    - GPT-5.4 기본 모델로 통일
+    - 고성능 endpoint/key는 기본 endpoint/key와 동일 값 사용 가능
+
+    [2026-02 v4.0]
     - Graph RAG 지원 (LightRAG 기반 Knowledge Graph)
     - 구조화 엔티티 추출 (LangExtract 기반)
-    - GPT-5.2 기본 모델 (Vision + Reasoning 통합)
+    - GPT-5.x 기본 모델 (Vision + Reasoning 통합)
     - API Version: 2024-12-01-preview
     - Structured Outputs / max_completion_tokens 지원
     - Document Intelligence API: 2024-11-30 (GA)
     """
 
     # =================================================================
-    # Azure OpenAI 설정 (GPT-5.2, Claude 등 최신 모델 지원)
+    # Azure OpenAI 설정 (GPT-5.4, Claude 등 최신 모델 지원)
     # =================================================================
 
-    # 기본 엔드포인트 (GPT-5.2 지원)
+    # 기본 엔드포인트 (GPT-5.4 지원)
     OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
     OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 
     # API 버전 (환경 변수 우선, 기본값: 2024-12-01-preview)
     OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 
-    # 고성능 모델 전용 엔드포인트 (GPT-5.2, Claude 등)
+    # 고성능 모델 전용 엔드포인트 (기본 endpoint/key와 동일 값 사용 가능)
     OPENAI_API_KEY_5 = os.getenv("OPEN_AI_KEY_5")
     OPENAI_ENDPOINT_5 = os.getenv("OPEN_AI_ENDPOINT_5")
 
@@ -39,7 +48,8 @@ class Config:
     # =================================================================
     MODELS = {
         # GPT-5.x 시리즈 (model-router를 통해 최신 모델 자동 라우팅)
-        "gpt-5.2": os.getenv("MODEL_DEPLOYMENT_GPT5_2", "model-router"),
+        "gpt-5.4": os.getenv("MODEL_DEPLOYMENT_GPT5_4", os.getenv("MODEL_DEPLOYMENT_GPT5_2", "model-router")),
+        "gpt-5.2": os.getenv("MODEL_DEPLOYMENT_GPT5_2", os.getenv("MODEL_DEPLOYMENT_GPT5_4", "model-router")),
         "gpt-5.1": os.getenv("MODEL_DEPLOYMENT_GPT5_1", "model-router"),
         "gpt-5": os.getenv("MODEL_DEPLOYMENT_GPT5", "model-router"),
         "gpt-5-mini": os.getenv("MODEL_DEPLOYMENT_GPT5_MINI", "model-router"),
@@ -58,20 +68,20 @@ class Config:
 
     # 고성능 엔드포인트를 사용할 모델 리스트 (frozenset으로 멤버쉽 검사 O(1))
     ADVANCED_MODELS = frozenset([
-        "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
+        "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
         "o3", "o4-mini",
         "claude-opus-4-5", "claude-sonnet-4-5"
     ])
 
     # Reasoning 지원 모델 (reasoning_effort 파라미터 사용 가능)
     REASONING_MODELS = frozenset([
-        "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
+        "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
         "o3", "o4-mini"
     ])
 
     # Structured Outputs 지원 모델
     STRUCTURED_OUTPUT_MODELS = frozenset([
-        "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
+        "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini",
         "gpt-4.1", "o3", "o4-mini"
     ])
 
@@ -79,14 +89,14 @@ class Config:
     # 기본 모델 설정
     # =================================================================
 
-    # 기본 질문 답변 모델 (GPT-5.2로 업그레이드)
-    DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.2")
+    # 기본 질문 답변 모델
+    DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.4")
 
-    # Vision/이미지 분석용 모델 (GPT-5.2 Vision 사용)
-    VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.2")
+    # Vision/이미지 분석용 모델
+    VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.4")
 
     # 문서 파싱용 모델
-    PARSING_MODEL = os.getenv("PARSING_MODEL", "gpt-5.2")
+    PARSING_MODEL = os.getenv("PARSING_MODEL", "gpt-5.4")
 
     # =================================================================
     # 임베딩 설정
@@ -103,10 +113,20 @@ class Config:
     DI_ENDPOINT = os.getenv("AZURE_DI_ENDPOINT")
 
     # Azure AI Search 설정
-    SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
-    SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-    # 현재 활성화된 인덱스명 (환경 변수보다 이 파일의 설정을 우선시하도록 수정)
-    SEARCH_INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME", "")
+    # 기존 인덱스를 재사용할 수 있도록 필드명과 시맨틱 설정명을 모두 환경 변수로 매핑합니다.
+    SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY") or os.getenv("AZURE_SEARCH_API_KEY")
+    SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT") or os.getenv("AZURE_SEARCH_SERVICE_ENDPOINT")
+    # 현재 활성화된 인덱스명
+    SEARCH_INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME") or os.getenv("SEARCH_INDEX_NAME", "")
+    SEARCH_ID_FIELD = os.getenv("AZURE_SEARCH_ID_FIELD", "chunk_id")
+    SEARCH_CONTENT_FIELD = os.getenv("AZURE_SEARCH_CONTENT_FIELD", "chunk")
+    SEARCH_ORIGINAL_CONTENT_FIELD = os.getenv("AZURE_SEARCH_ORIGINAL_CONTENT_FIELD", "original_chunk")
+    SEARCH_VECTOR_FIELD = os.getenv("AZURE_SEARCH_VECTOR_FIELD", "text_vector")
+    SEARCH_TITLE_FIELD = os.getenv("AZURE_SEARCH_TITLE_FIELD", "title")
+    SEARCH_PARENT_FIELD = os.getenv("AZURE_SEARCH_PARENT_FIELD", "parent_id")
+    # 사용자에게 보여줄 출처 라벨. 외부 인덱스에서는 title 같은 사람이 읽기 쉬운 필드를 권장합니다.
+    SEARCH_SOURCE_FIELD = os.getenv("AZURE_SEARCH_SOURCE_FIELD", "parent_id")
+    SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG", "my-semantic-config")
 
     # =================================================================
     # Graph RAG 설정 (v4.0 신규 - LightRAG 기반)
@@ -128,6 +148,24 @@ class Config:
     GRAPH_TOP_K = int(os.getenv("GRAPH_TOP_K", "10"))
 
     # =================================================================
+    # Contextual Retrieval 설정 (v4.1 신규 - Anthropic 방식)
+    # 각 청크에 문서 전체 맥락을 LLM으로 생성하여 추가
+    # BM25 키워드 검색 + 벡터 유사성 검색 결합 시 검색 실패율 49% 감소
+    # =================================================================
+
+    # Contextual Retrieval 활성화 여부
+    CONTEXTUAL_RETRIEVAL_ENABLED = os.getenv("CONTEXTUAL_RETRIEVAL_ENABLED", "true").lower() == "true"
+
+    # 맥락 생성에 사용할 모델 (비용 효율적인 모델 권장)
+    CONTEXTUAL_RETRIEVAL_MODEL = os.getenv("CONTEXTUAL_RETRIEVAL_MODEL", "gpt-5.4")
+
+    # 맥락 텍스트 최대 토큰 수 (50-150 토큰 권장)
+    CONTEXTUAL_RETRIEVAL_MAX_TOKENS = int(os.getenv("CONTEXTUAL_RETRIEVAL_MAX_TOKENS", "150"))
+
+    # 맥락 생성 배치 크기 (동시 처리할 청크 수)
+    CONTEXTUAL_RETRIEVAL_BATCH_SIZE = int(os.getenv("CONTEXTUAL_RETRIEVAL_BATCH_SIZE", "5"))
+
+    # =================================================================
     # 구조화 추출 설정 (v4.0 신규 - LangExtract 기반)
     # =================================================================
 
@@ -140,6 +178,30 @@ class Config:
     # 병렬 추출 워커 수
     EXTRACTION_MAX_WORKERS = int(os.getenv("EXTRACTION_MAX_WORKERS", "4"))
 
+    # =================================================================
+    # Retrieval / Guardrails / Evaluation settings
+    # =================================================================
+    RETRIEVAL_GATE_ENABLED = os.getenv("RETRIEVAL_GATE_ENABLED", "true").lower() == "true"
+    RETRIEVAL_GATE_MIN_TOP_SCORE = float(os.getenv("RETRIEVAL_GATE_MIN_TOP_SCORE", "0.15"))
+    RETRIEVAL_GATE_MIN_DOC_COUNT = int(os.getenv("RETRIEVAL_GATE_MIN_DOC_COUNT", "1"))
+    RETRIEVAL_GATE_MIN_DOC_SCORE = float(os.getenv("RETRIEVAL_GATE_MIN_DOC_SCORE", "0.05"))
+    RETRIEVAL_GATE_SOFT_MODE = os.getenv("RETRIEVAL_GATE_SOFT_MODE", "true").lower() == "true"
+    RETRIEVAL_GATE_NOT_FOUND_MESSAGE = os.getenv(
+        "RETRIEVAL_GATE_NOT_FOUND_MESSAGE",
+        "관련 문서를 충분히 찾지 못했습니다. 다른 키워드로 다시 질문해 주세요.",
+    )
+
+    EXACT_CITATION_ENABLED = os.getenv("EXACT_CITATION_ENABLED", "true").lower() == "true"
+    NUMERIC_VERIFICATION_ENABLED = os.getenv("NUMERIC_VERIFICATION_ENABLED", "true").lower() == "true"
+    PII_DETECTION_ENABLED = os.getenv("PII_DETECTION_ENABLED", "true").lower() == "true"
+    INJECTION_DETECTION_ENABLED = os.getenv("INJECTION_DETECTION_ENABLED", "true").lower() == "true"
+    FAITHFULNESS_ENABLED = os.getenv("FAITHFULNESS_ENABLED", "true").lower() == "true"
+    FAITHFULNESS_THRESHOLD = float(os.getenv("FAITHFULNESS_THRESHOLD", "0.85"))
+    HALLUCINATION_DETECTION_ENABLED = os.getenv("HALLUCINATION_DETECTION_ENABLED", "true").lower() == "true"
+    HALLUCINATION_THRESHOLD = float(os.getenv("HALLUCINATION_THRESHOLD", "0.8"))
+
+    EVALUATION_JUDGE_MODEL = os.getenv("EVALUATION_JUDGE_MODEL", "gpt-5.4")
+
     @classmethod
     def validate(cls):
         """필수 환경 변수가 설정되어 있는지 확인합니다."""
@@ -150,6 +212,7 @@ class Config:
         if not cls.DI_ENDPOINT: missing.append("AZURE_DI_ENDPOINT")
         if not cls.SEARCH_KEY: missing.append("AZURE_SEARCH_KEY")
         if not cls.SEARCH_ENDPOINT: missing.append("AZURE_SEARCH_ENDPOINT")
+        if not cls.SEARCH_INDEX_NAME: missing.append("AZURE_SEARCH_INDEX_NAME")
 
         if missing:
             error_msg = "\n".join([f"❌ 환경 변수 누락: {var}" for var in missing])

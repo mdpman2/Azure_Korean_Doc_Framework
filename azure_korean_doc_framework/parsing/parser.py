@@ -1,6 +1,7 @@
 import os
 import re
 import base64
+from bisect import bisect_right
 from io import BytesIO
 from typing import List, Dict, Any, Optional, Tuple
 from PIL import Image
@@ -11,10 +12,10 @@ from ..config import Config
 class HybridDocumentParser:
     """
     다양한 문서 형식(PDF, PPTX, DOCX)을 처리하여 구조화된 세그먼트를 추출하는 파서.
-    Azure Document Intelligence(Layout Model) + GPT-5.2(Vision + Reasoning)를 결합하여 사용.
+    Azure Document Intelligence(Layout Model) + GPT-5.4(Vision + Reasoning)를 결합하여 사용.
 
     [2026-01 v3.0 업데이트]
-    - GPT-5.2 Vision 사용 (향상된 이미지 분석)
+    - GPT-5.4 Vision 사용 (향상된 이미지 분석)
     - Structured Outputs 지원
     - max_completion_tokens 파라미터 사용
     - 향상된 한국어 OCR 지원
@@ -25,10 +26,10 @@ class HybridDocumentParser:
 
     def __init__(self, vision_model: str = None):
         self.di_client = AzureClientFactory.get_di_client()
-        # GPT-5.2 지원을 위해 is_advanced=True로 클라이언트 초기화
+        # GPT-5.4 지원을 위해 is_advanced=True로 클라이언트 초기화
         self.aoai_client = AzureClientFactory.get_openai_client(is_advanced=True)
-        # Vision 모델: GPT-5.2 기본 사용 (Config.VISION_MODEL)
-        self.gpt_model = vision_model or Config.MODELS.get(Config.VISION_MODEL, "gpt-5.2")
+        # Vision 모델: GPT-5.4 기본 사용 (Config.VISION_MODEL)
+        self.gpt_model = vision_model or Config.MODELS.get(Config.VISION_MODEL, Config.VISION_MODEL)
 
     def _encode_image_base64(self, pil_image: Image.Image) -> str:
         """PIL 이미지를 Base64 문자열로 인코딩합니다."""
@@ -191,9 +192,12 @@ class HybridDocumentParser:
                 "page": table.bounding_regions[0].page_number if table.bounding_regions else 1
             })
 
-            # 스팬 범위 저장
+            # 스팬 범위 저장 (이진 탐색 최적화를 위해 start 기준 정렬 후 사용)
             for span in table.spans:
                 table_spans.append((span.offset, span.offset + span.length))
+
+        # 이진 탐색을 위해 start 기준 정렬
+        table_spans.sort()
 
         # 4. Paragraphs (Text & Headers) 추출
         for para in (result.paragraphs or []):
@@ -298,7 +302,18 @@ class HybridDocumentParser:
         return segments
 
     def _is_offset_in_ranges(self, offset: int, ranges: List[Tuple[int, int]]) -> bool:
-        for start, end in ranges:
+        """이진 탐색으로 offset이 정렬된 범위 리스트 안에 있는지 확인 (O(log N))"""
+        if not ranges:
+            return False
+        # ranges가 정렬되어 있다고 가정 (호출자가 start 기준 정렬)
+        idx = bisect_right(ranges, (offset,)) - 1
+        if idx >= 0:
+            start, end = ranges[idx]
+            if start <= offset < end:
+                return True
+        # 현재 위치 이후 범위도 확인
+        if idx + 1 < len(ranges):
+            start, end = ranges[idx + 1]
             if start <= offset < end:
                 return True
         return False

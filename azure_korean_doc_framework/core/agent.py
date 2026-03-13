@@ -1,16 +1,26 @@
 import json
+import hashlib
 from typing import List, Tuple, Optional, Union
 from azure.search.documents.models import VectorizedQuery
 from .multi_model_manager import MultiModelManager
+from .schema import AnswerArtifacts, PipelineStep, SearchResult
 from ..utils.azure_clients import AzureClientFactory
 from ..config import Config
+from ..generation.evidence_extractor import EvidenceExtractor
+from ..guardrails.retrieval_gate import RetrievalQualityGate
+from ..guardrails.numeric_verifier import NumericVerifier
+from ..guardrails.pii import KoreanPIIDetector
+from ..guardrails.injection import PromptInjectionDetector
+from ..guardrails.faithfulness import FaithfulnessChecker
+from ..guardrails.hallucination import HallucinationDetector
+from ..guardrails.question_classifier import QuestionClassifier
 
 # 공통 RAG 시스템 프롬프트 (answer_question / graph_enhanced_answer 공유)
 _RAG_SYSTEM_PROMPT = (
     "당신은 문서 분석 및 Q&A 전문가입니다. "
     "주어진 [Context] 내용을 바탕으로 사용자의 [Question]에 한국어로 친절하고 정확하게 답변하세요. "
     "\n\n### 답변 규칙:"
-    "\n1. 답변 시 반드시 해당 정보의 **출처(파일명)**를 언급하세요. (예: '...입니다 [출처: 파일명.pdf]')"
+    "\n1. 답변 시 반드시 해당 정보의 **출처(문서명 또는 제목)**를 언급하세요. (예: '...입니다 [출처: 성균관대.pdf]')"
     "\n2. 여러 문서에서 정보를 취합한 경우, 각각의 출처를 밝히세요."
     "\n3. 추출된 정보가 부족하면 아는 범위 내에서 최선을 다해 답변하되, 정보가 전혀 없다면 솔직하게 모른다고 답하세요."
 )
@@ -25,16 +35,17 @@ class KoreanDocAgent:
     """
     한국어 문서 분석 및 Q&A 전문가 검색 에이전트.
 
-    Azure AI Search의 Hybrid Search + Semantic Ranking을 활용하여 문맥을 찾고,
-    GPT-5.2를 통해 지능적인 답변을 생성합니다.
+    Azure AI Search의 Hybrid Search (BM25 키워드 + Vector 유사성 + Semantic Ranking)을 활용하여
+    문맥을 찾고, GPT-5.4를 통해 지능적인 답변을 생성합니다.
 
-    [2026-02 v4.0 업데이트]
+    [2026-02 v4.1 업데이트 - Contextual Retrieval]
+    - Contextual Retrieval (Anthropic 방식): 청크에 맥락 추가하여 BM25 + 벡터 검색 동시 개선
+    - Hybrid Search: BM25 키워드 검색 + Vector 유사성 검색 결합 (Reciprocal Rank Fusion)
+    - Azure AI Search 네이티브 하이브리드 검색 + 시맨틱 래킹 활용
+    - 기존 Azure AI Search 인덱스도 환경 변수 기반 필드 매핑으로 재사용 가능
     - Graph-Enhanced RAG (LightRAG 기반 Knowledge Graph 연동)
-    - 구조화 엔티티 추출 결과 활용 (LangExtract 기반)
-    - GPT-5.2 기본 모델 사용
+    - GPT-5.4 기본 모델 사용
     - Query Rewrite 지원 (시맨틱 쿼리 확장)
-    - 향상된 Semantic Ranking (L2 reranking)
-    - Dual-Mode 검색: Vector + Graph 하이브리드
     """
 
     def __init__(self, model_key: Optional[str] = None, graph_manager=None):
@@ -43,7 +54,7 @@ class KoreanDocAgent:
 
         Args:
             model_key: 답변 생성 시 기본으로 사용할 모델 키 (Config.MODELS에 정의된 키).
-                      기본값: Config.DEFAULT_MODEL (gpt-5.2)
+                      기본값: Config.DEFAULT_MODEL (gpt-5.4)
             graph_manager: KnowledgeGraphManager 인스턴스 (Graph RAG 사용 시)
         """
         self.model_manager = MultiModelManager(default_model=model_key or Config.DEFAULT_MODEL)
@@ -61,9 +72,29 @@ class KoreanDocAgent:
         # [v4.0] Graph RAG 매니저 (LightRAG 기반)
         self.graph_manager = graph_manager
 
+        self.question_classifier = QuestionClassifier()
+        self.evidence_extractor = EvidenceExtractor(self.model_manager)
+        self.retrieval_gate = RetrievalQualityGate(
+            min_top_score=Config.RETRIEVAL_GATE_MIN_TOP_SCORE,
+            min_doc_count=Config.RETRIEVAL_GATE_MIN_DOC_COUNT,
+            min_doc_score=Config.RETRIEVAL_GATE_MIN_DOC_SCORE,
+            soft_mode=Config.RETRIEVAL_GATE_SOFT_MODE,
+        )
+        self.numeric_verifier = NumericVerifier()
+        self.pii_detector = KoreanPIIDetector()
+        self.injection_detector = PromptInjectionDetector(self.model_manager)
+        self.faithfulness_checker = FaithfulnessChecker(
+            self.model_manager,
+            threshold=Config.FAITHFULNESS_THRESHOLD,
+        )
+        self.hallucination_detector = HallucinationDetector(
+            self.model_manager,
+            threshold=Config.HALLUCINATION_THRESHOLD,
+        )
+
     def _rewrite_query(self, question: str) -> List[str]:
         """
-        GPT-5.2를 사용하여 쿼리를 의미적으로 확장합니다.
+        GPT-5.4를 사용하여 쿼리를 의미적으로 확장합니다.
         오타 교정, 동의어 생성, 다양한 표현으로 쿼리 변형.
 
         Args:
@@ -85,7 +116,7 @@ class KoreanDocAgent:
 출력 형식: ["쿼리1", "쿼리2", "쿼리3"]"""
 
             response = self.llm_client.chat.completions.create(
-                model=Config.MODELS.get("gpt-5.2", "gpt-5.2"),
+                model=Config.MODELS.get(Config.DEFAULT_MODEL, Config.DEFAULT_MODEL),
                 messages=[{"role": "user", "content": rewrite_prompt}],
                 temperature=0.3,
                 max_completion_tokens=200
@@ -102,16 +133,25 @@ class KoreanDocAgent:
             print(f"   ⚠️ Query rewrite failed, using original: {e}")
             return [question]
 
-    # ==================== 공통 벡터 검색 로직 ====================
+    # ==================== 하이브리드 검색 (BM25 + Vector + Semantic Ranking) ====================
 
     def _vector_search(
         self,
         question: str,
         search_queries: List[str],
         top_k: int = 5,
-    ) -> List[str]:
+    ) -> List[SearchResult]:
         """
-        Azure AI Search 하이브리드 검색 (벡터 + 키워드 + 시맨틱 랭킹)
+        Azure AI Search 하이브리드 검색 (BM25 키워드 + 벡터 유사성 + 시맨틱 랭킹)
+
+        Contextual Retrieval 기반:
+        - BM25 키워드 검색: Config.SEARCH_CONTENT_FIELD (맥락 포함 텍스트)
+        - 벡터 유사성 검색: Config.SEARCH_VECTOR_FIELD (맥락 포함 임베딩)
+        - 시맨틱 랭킹: Config.SEARCH_SEMANTIC_CONFIG로 최종 재순위
+        - Reciprocal Rank Fusion (RRF): BM25 + Vector 결과 자동 결합
+
+        검색 시 맥락 포함 필드로 BM25/벡터 검색 → 높은 검색 정확도
+        결과 반환 시 Config.SEARCH_ORIGINAL_CONTENT_FIELD로 원본 텍스트 반환 → 깔끔한 답변 생성
 
         Args:
             question: 원본 질문 (임베딩용)
@@ -119,42 +159,256 @@ class KoreanDocAgent:
             top_k: 검색할 문서 수
 
         Returns:
-            검색된 컨텍스트 리스트
+            검색된 컨텍스트 리스트 (원본 텍스트 기반)
         """
+        # 임베딩은 원본 질문으로 1회만 생성 (각 search_query별 중복 API 호출 방지)
         embedding_response = self.embedding_client.embeddings.create(
             input=[question],
             model=Config.EMBEDDING_DEPLOYMENT
         )
         query_vector = embedding_response.data[0].embedding
-        vector_query = VectorizedQuery(vector=query_vector, k_nearest_neighbors=50, fields="text_vector")
+        vector_query = VectorizedQuery(
+            vector=query_vector,
+            k=50,
+            fields=Config.SEARCH_VECTOR_FIELD,
+        )
 
-        all_contexts = []
-        seen_contexts: set = set()
+        select_fields = list(dict.fromkeys([
+            Config.SEARCH_ID_FIELD,
+            Config.SEARCH_CONTENT_FIELD,
+            Config.SEARCH_ORIGINAL_CONTENT_FIELD,
+            Config.SEARCH_TITLE_FIELD,
+            Config.SEARCH_SOURCE_FIELD,
+        ]))
+
+        deduplicated_results = {}
 
         try:
             for search_query in search_queries:
+                # Hybrid Search: BM25 (search_text) + Vector (vector_queries) + Semantic Ranking
+                # Azure AI Search는 내부적으로 RRF(Reciprocal Rank Fusion)를 사용하여
+                # BM25 결과와 Vector 결과를 자동으로 결합합니다.
                 results = self.search_client.search(
-                    search_text=search_query,
-                    vector_queries=[vector_query],
-                    select=["chunk", "parent_id"],
-                    query_type="semantic",
-                    semantic_configuration_name="my-semantic-config",
+                    search_text=search_query,           # BM25 키워드 검색 (Contextual BM25)
+                    vector_queries=[vector_query],       # 벡터 유사성 검색 (Contextual Embeddings)
+                    select=select_fields,
+                    query_type="semantic",               # Semantic Ranker로 최종 재순위
+                    semantic_configuration_name=Config.SEARCH_SEMANTIC_CONFIG,
                     top=top_k
                 )
 
                 for r in results:
-                    content = r.get('chunk') or r.get('content') or ""
-                    source = r.get('parent_id') or "알 수 없는 출처"
+                    # 답변 생성에는 원본 텍스트 사용 (맥락 제외)
+                    content = (
+                        r.get(Config.SEARCH_ORIGINAL_CONTENT_FIELD)
+                        or r.get(Config.SEARCH_CONTENT_FIELD)
+                        or ""
+                    )
+                    if not content:
+                        continue
 
-                    context_entry = f"[출처: {source}]\n{content}"
-                    if content and context_entry not in seen_contexts:
-                        seen_contexts.add(context_entry)
-                        all_contexts.append(context_entry)
+                    source = (
+                        r.get(Config.SEARCH_SOURCE_FIELD)
+                        or r.get(Config.SEARCH_TITLE_FIELD)
+                        or r.get(Config.SEARCH_ID_FIELD)
+                        or "알 수 없는 출처"
+                    )
+                    score = self._extract_search_score(r)
+                    content_key = hashlib.sha1(f"{source}\n{content}".encode("utf-8")).hexdigest()
+                    candidate = SearchResult(
+                        content=content,
+                        source=source,
+                        score=score,
+                        metadata={"raw_chunk": r.get(Config.SEARCH_CONTENT_FIELD, '')},
+                    )
+
+                    existing = deduplicated_results.get(content_key)
+                    if existing is None or candidate.score > existing.score:
+                        deduplicated_results[content_key] = candidate
 
         except Exception as e:
             print(f"   ❌ Search failed: {e}")
 
-        return all_contexts[:top_k * 2]
+        ranked_results = sorted(
+            deduplicated_results.values(),
+            key=lambda item: item.score,
+            reverse=True,
+        )
+        return ranked_results[:top_k * 2]
+
+    def _extract_search_score(self, result) -> float:
+        for key in ("@search.reranker_score", "@search.score"):
+            value = result.get(key)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    def _format_contexts(self, results: List[SearchResult]) -> List[str]:
+        return [f"[출처: {item.source}]\n{item.content}" for item in results]
+
+    def _generate_standard_answer(
+        self,
+        question: str,
+        contexts: List[str],
+        model_key: Optional[str] = None,
+        system_prompt: str = _RAG_SYSTEM_PROMPT,
+    ) -> str:
+        context_str = "\n\n".join(contexts) if contexts else "관련된 문서 내용을 찾을 수 없습니다."
+        user_prompt = f"[Context]\n{context_str}\n\n[Question]\n{question}"
+        return self.model_manager.get_completion(
+            prompt=user_prompt,
+            model_key=model_key,
+            system_message=system_prompt,
+        )
+
+    def _run_guardrailed_answer(
+        self,
+        question: str,
+        search_results: List[SearchResult],
+        model_key: Optional[str] = None,
+        system_prompt: str = _RAG_SYSTEM_PROMPT,
+    ) -> AnswerArtifacts:
+        steps: List[PipelineStep] = []
+
+        if Config.INJECTION_DETECTION_ENABLED:
+            injection = self.injection_detector.detect(question, model_key=model_key)
+            steps.append(PipelineStep(
+                name="prompt_injection",
+                passed=not injection.blocked,
+                detail={"reason": injection.reason, "score": injection.score},
+            ))
+            if injection.blocked:
+                return AnswerArtifacts(
+                    answer="입력 내용이 안전하지 않아 요청을 처리할 수 없습니다.",
+                    steps=steps,
+                    search_results=search_results,
+                )
+
+        gate_reason = None
+        if Config.RETRIEVAL_GATE_ENABLED:
+            gate_result = self.retrieval_gate.evaluate(search_results)
+            steps.append(PipelineStep(
+                name="retrieval_gate",
+                passed=gate_result.passed,
+                detail={
+                    "reason": gate_result.reason,
+                    "top_score": gate_result.top_score,
+                    "qualifying_count": gate_result.qualifying_count,
+                    "soft_fail": gate_result.soft_fail,
+                },
+            ))
+            if not gate_result.passed and not gate_result.soft_fail:
+                return AnswerArtifacts(
+                    answer=Config.RETRIEVAL_GATE_NOT_FOUND_MESSAGE,
+                    steps=steps,
+                    search_results=search_results,
+                    gate_reason=gate_result.reason,
+                )
+            if not gate_result.passed:
+                gate_reason = gate_result.reason
+
+        question_type = self.question_classifier.classify(question)
+        steps.append(PipelineStep(
+            name="question_classification",
+            passed=True,
+            detail={"category": question_type.category, "reason": question_type.reason},
+        ))
+
+        contexts = self._format_contexts(search_results)
+        answer = ""
+        evidence_used = None
+        if Config.EXACT_CITATION_ENABLED and search_results:
+            if question_type.category == "regulatory":
+                evidence_used = self.evidence_extractor.extract_and_answer(question, search_results, model_key=model_key)
+            elif question_type.category == "extraction":
+                evidence_used = self.evidence_extractor.extract_short_answer(question, search_results, model_key=model_key)
+
+        if evidence_used is not None:
+            answer = evidence_used.answer
+            if evidence_used.sources and "[출처:" not in answer:
+                answer = f"{answer}\n\n[출처: {', '.join(evidence_used.sources)}]"
+            steps.append(PipelineStep(
+                name="evidence_extraction",
+                passed=True,
+                detail={
+                    "evidence_count": len(evidence_used.evidence_sentences),
+                    "sources": evidence_used.sources,
+                },
+            ))
+        else:
+            answer = self._generate_standard_answer(question, contexts, model_key=model_key, system_prompt=system_prompt)
+            steps.append(PipelineStep(name="generation", passed=not answer.startswith("❌")))
+
+        if Config.PII_DETECTION_ENABLED:
+            pii_matches = self.pii_detector.detect(answer)
+            answer = self.pii_detector.mask(answer)
+            steps.append(PipelineStep(
+                name="pii_masking",
+                passed=True,
+                detail={"match_count": len(pii_matches)},
+            ))
+
+        if Config.NUMERIC_VERIFICATION_ENABLED and answer and search_results:
+            verification = self.numeric_verifier.verify(answer, [item.content for item in search_results])
+            steps.append(PipelineStep(
+                name="numeric_verification",
+                passed=verification.passed,
+                detail={
+                    "total_numbers": verification.total_numbers_found,
+                    "ungrounded": verification.ungrounded_numbers,
+                },
+            ))
+
+        if Config.FAITHFULNESS_ENABLED and answer and search_results:
+            faithfulness = self.faithfulness_checker.verify(answer, [item.content for item in search_results], model_key=model_key)
+            steps.append(PipelineStep(
+                name="faithfulness",
+                passed=faithfulness.verdict == "FAITHFUL",
+                detail={
+                    "score": faithfulness.faithfulness_score,
+                    "distortions": faithfulness.distortions,
+                },
+            ))
+
+        if Config.HALLUCINATION_DETECTION_ENABLED and answer and search_results:
+            hallucination = self.hallucination_detector.verify(answer, [item.content for item in search_results], model_key=model_key)
+            steps.append(PipelineStep(
+                name="hallucination",
+                passed=hallucination.verdict == "PASS",
+                detail={
+                    "grounded_ratio": hallucination.grounded_ratio,
+                    "ungrounded_claims": hallucination.ungrounded_claims,
+                },
+            ))
+
+        return AnswerArtifacts(
+            answer=answer,
+            contexts=contexts,
+            steps=steps,
+            search_results=search_results,
+            gate_reason=gate_reason,
+        )
+
+    def _prepare_search(self, question: str, use_query_rewrite: bool) -> List[str]:
+        """
+        검색 준비: Query Rewrite를 적용하여 검색 쿼리를 생성합니다.
+
+        Args:
+            question: 원본 질문
+            use_query_rewrite: Query Rewrite 사용 여부
+
+        Returns:
+            검색 쿼리 리스트
+        """
+        search_queries = [question]
+        if use_query_rewrite and self.enable_query_rewrite:
+            search_queries = self._rewrite_query(question)
+            if len(search_queries) > 1:
+                print(f"   📝 Query expanded to {len(search_queries)} variants")
+        return search_queries
 
     def answer_question(
         self,
@@ -169,7 +423,7 @@ class KoreanDocAgent:
 
         1. Query Rewrite (선택적): 질문을 의미적으로 확장
         2. AI Search에서 하이브리드 검색(벡터+키워드) 및 시맨틱 랭킹 수행
-        3. 검색된 문맥(Context)을 바탕으로 GPT-5.2로 답변 생성 (출처 정보 포함)
+        3. 검색된 문맥(Context)을 바탕으로 GPT-5.4로 답변 생성 (출처 정보 포함)
 
         Args:
             question: 사용자의 질문 문자열.
@@ -181,35 +435,23 @@ class KoreanDocAgent:
         Returns:
             답변 문자열 또는 (답변, 컨텍스트 리스트) 튜플.
         """
-        print(f"🔎 Searching for: {question} (top_k={top_k})")
+        print(f"🔎 Searching for: {question} (top_k={top_k}, hybrid=BM25+Vector+Semantic)")
 
-        # 0. Query Rewrite (선택적)
-        search_queries = [question]
-        if use_query_rewrite and self.enable_query_rewrite:
-            search_queries = self._rewrite_query(question)
-            if len(search_queries) > 1:
-                print(f"   📝 Query expanded to {len(search_queries)} variants")
+        # 0. Query Rewrite (선택적) — 공통 로직
+        search_queries = self._prepare_search(question, use_query_rewrite)
 
         # 1. 벡터 검색 (공통 로직)
-        contexts = self._vector_search(question, search_queries, top_k)
-        context_str = "\n\n".join(contexts)
-
-        if not context_str:
-            print("   ⚠️ No relevant documentation found.")
-            context_str = "관련된 문서 내용을 찾을 수 없습니다."
-
-        user_prompt = f"[Context]\n{context_str}\n\n[Question]\n{question}"
-
-        # LLM 호출을 통한 답변 생성
-        answer = self.model_manager.get_completion(
-            prompt=user_prompt,
+        search_results = self._vector_search(question, search_queries, top_k)
+        artifacts = self._run_guardrailed_answer(
+            question,
+            search_results,
             model_key=model_key,
-            system_message=_RAG_SYSTEM_PROMPT
+            system_prompt=_RAG_SYSTEM_PROMPT,
         )
 
         if return_context:
-            return answer, contexts
-        return answer
+            return artifacts.answer, artifacts.contexts
+        return artifacts.answer
 
     # ==================== v4.0: Graph-Enhanced RAG ====================
 
@@ -244,11 +486,9 @@ class KoreanDocAgent:
         print(f"🔎 [Graph-Enhanced] Searching for: {question}")
 
         # === Part 1: 벡터 검색 (공통 로직) ===
-        search_queries = [question]
-        if use_query_rewrite and self.enable_query_rewrite:
-            search_queries = self._rewrite_query(question)
+        search_queries = self._prepare_search(question, use_query_rewrite)
 
-        vector_contexts = self._vector_search(question, search_queries, top_k)
+        vector_results = self._vector_search(question, search_queries, top_k)
 
         # === Part 2: Knowledge Graph 검색 (v4.0 신규) ===
         graph_context = ""
@@ -277,6 +517,7 @@ class KoreanDocAgent:
                 print(f"   ⚠️ Graph query failed: {e}")
 
         # === Part 3: 결합된 컨텍스트로 답변 생성 ===
+        vector_contexts = self._format_contexts(vector_results)
         vector_context_str = "\n\n".join(vector_contexts)
 
         if not vector_context_str and not graph_context:
@@ -291,14 +532,22 @@ class KoreanDocAgent:
                 f"[Knowledge Graph 분석]\n{graph_context}"
             )
 
-        user_prompt = f"[Context]\n{combined_context}\n\n[Question]\n{question}"
+        augmented_results = list(vector_results)
+        if graph_context:
+            augmented_results.insert(0, SearchResult(
+                content=graph_context,
+                source="knowledge_graph",
+                score=1.0,
+                metadata={"graph": True},
+            ))
 
-        answer = self.model_manager.get_completion(
-            prompt=user_prompt,
+        artifacts = self._run_guardrailed_answer(
+            question,
+            augmented_results,
             model_key=model_key,
-            system_message=_GRAPH_RAG_SYSTEM_PROMPT
+            system_prompt=_GRAPH_RAG_SYSTEM_PROMPT,
         )
 
         if return_context:
-            return answer, vector_contexts
-        return answer
+            return artifacts.answer, artifacts.contexts
+        return artifacts.answer

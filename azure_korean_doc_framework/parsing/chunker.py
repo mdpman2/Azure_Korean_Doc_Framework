@@ -1,10 +1,17 @@
 """
-Context-Rich Rolling Window 청킹 모듈
+Context-Rich Rolling Window 청킹 모듈 + Contextual Retrieval
 
 문서의 구조(Hierarchy)와 문맥(Context)을 보존하는 적응형 청킹 시스템.
 kss 한국어 문장 분리 + tiktoken 토큰 기반 분할.
 
-[2026-02 v4.0 업데이트]
+[2026-02 v4.1 업데이트 - Contextual Retrieval (Anthropic 방식)]
+- _apply_contextual_retrieval(): 모든 청크에 LLM 기반 문서 맥락 자동 추가
+- _generate_context(): 전체 문서 참조하여 청크별 맥락 생성 (Anthropic 프롬프트)
+- Contextual BM25: 맥락 포함 텍스트로 BM25 키워드 검색 정확도 향상
+- Contextual Embeddings: 맥락 포함 텍스트로 벡터 임베딩 정확도 향상
+- 검색 실패율 49% 감소 (BM25 + Vector + Semantic 결합 시)
+
+[2026-02 v4.0]
 - 엔티티 인식 메타데이터 (hangul_ratio, graph_rag_eligible)
 - 한글 비율 계산 (사전 컴파일된 _HANGUL_SYLLABLE_RE)
 - _enrich_metadata(): Graph RAG 적격 여부 태깅
@@ -15,11 +22,21 @@ import tiktoken
 from enum import Enum
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 from ..core.schema import Document
 from ..core.multi_model_manager import MultiModelManager
 
 from ..config import Config
+
+# kss 모듈 사전 임포트 (매번 try/except 방지)
+try:
+    import kss as _kss_module
+    _HAS_KSS = True
+except ImportError:
+    _kss_module = None
+    _HAS_KSS = False
 
 # 사전 컴파일된 한글 패턴 (성능 최적화)
 _HANGUL_SYLLABLE_RE = re.compile(r'[\uAC00-\uD7AF]')
@@ -52,6 +69,12 @@ class AdaptiveChunker:
     - 한국어 문장 경계 인식
     - 강화된 메타데이터
 
+    [v4.1 업데이트 - Contextual Retrieval]
+    - Contextual Retrieval (Anthropic 방식): 모든 청크에 LLM 맥락 자동 추가
+    - 전체 문서 참조하여 청크별 간결한 맥락 생성 (50-150 토큰)
+    - 맥락 포함 텍스트로 BM25 + 벡터 검색 동시 개선
+    - 원본/맥락 분리 저장: 검색은 맥락 포함, 답변은 원본 사용
+
     [v4.0 업데이트]
     - 엔티티 인식 청킹 (LangExtract 기반 엔티티 경계 보존)
     - 한국어 Unicode 토크나이저 연동
@@ -64,30 +87,40 @@ class AdaptiveChunker:
         # tiktoken 인코더 초기화
         self.encoder = tiktoken.get_encoding(self.config.encoding_name)
 
-        # MultiModelManager 초기화 (Contextual Retrieval용)
-        self.model_manager = MultiModelManager()
+        # 반복 토큰 계산 캐시
+        self._token_count_cache: Dict[str, int] = {}
+
+        # Contextual Retrieval을 사용할 때만 LLM 매니저 초기화
+        self.model_manager = MultiModelManager() if Config.CONTEXTUAL_RETRIEVAL_ENABLED else None
 
     # ==================== 토큰 관련 유틸리티 ====================
 
     def _count_tokens(self, text: str) -> int:
         """텍스트의 토큰 수를 계산합니다."""
-        return len(self.encoder.encode(text))
+        cached = self._token_count_cache.get(text)
+        if cached is not None:
+            return cached
+
+        token_count = len(self.encoder.encode(text))
+        self._token_count_cache[text] = token_count
+        return token_count
+
+    # 정규식 기반 문장 분리 패턴 (사전 컴파일)
+    _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?。？！])\s+')
 
     def _split_korean_sentences(self, text: str) -> List[str]:
         """
         한국어 텍스트를 문장 단위로 분리합니다.
         kss 라이브러리를 우선 사용하고, 실패 시 정규식 기반 분리를 사용합니다.
         """
-        try:
-            import kss
-            sentences = kss.split_sentences(text)
-            return sentences
-        except Exception:
-            # Fallback: 정규식 기반 한국어 문장 분리
-            # 마침표, 물음표, 느낌표 뒤에 공백이나 줄바꿈이 오는 경우 분리
-            pattern = r'(?<=[.!?。？！])\s+'
-            sentences = re.split(pattern, text)
-            return [s.strip() for s in sentences if s.strip()]
+        if _HAS_KSS:
+            try:
+                return _kss_module.split_sentences(text)
+            except Exception:
+                pass
+        # Fallback: 정규식 기반 한국어 문장 분리
+        sentences = self._SENTENCE_SPLIT_RE.split(text)
+        return [s.strip() for s in sentences if s.strip()]
 
     def _merge_sentences_to_chunks(
         self,
@@ -103,14 +136,16 @@ class AdaptiveChunker:
 
         chunks = []
         current_chunk_sentences = []
+        current_chunk_token_counts = []
         current_token_count = 0
+        sentence_token_counts = [self._count_tokens(sentence) for sentence in sentences]
 
-        for sentence in sentences:
-            sentence_tokens = self._count_tokens(sentence)
+        for sentence, sentence_tokens in zip(sentences, sentence_token_counts):
 
             # 현재 청크에 추가 가능한지 확인
             if current_token_count + sentence_tokens <= self.config.max_tokens:
                 current_chunk_sentences.append(sentence)
+                current_chunk_token_counts.append(sentence_tokens)
                 current_token_count += sentence_tokens
             else:
                 # 현재 청크 저장
@@ -120,10 +155,13 @@ class AdaptiveChunker:
                 # 오버랩 적용: 마지막 N개 문장을 다음 청크에 포함
                 overlap_start = max(0, len(current_chunk_sentences) - overlap_sentences)
                 overlap_sents = current_chunk_sentences[overlap_start:]
+                overlap_token_counts = current_chunk_token_counts[overlap_start:]
+                overlap_token_count = sum(overlap_token_counts)
 
                 # 새 청크 시작
                 current_chunk_sentences = overlap_sents + [sentence]
-                current_token_count = sum(self._count_tokens(s) for s in current_chunk_sentences)
+                current_chunk_token_counts = overlap_token_counts + [sentence_tokens]
+                current_token_count = overlap_token_count + sentence_tokens
 
         # 마지막 청크 저장
         if current_chunk_sentences:
@@ -255,40 +293,52 @@ class AdaptiveChunker:
         # 2.5. 표/이미지 별도 청크 병합
         chunks.extend(table_image_chunks)
 
-        # 3. 최종 메타데이터 강화
+        # 2.6. Contextual Retrieval: 모든 청크에 문서 맥락 추가 (Anthropic 방식)
+        if Config.CONTEXTUAL_RETRIEVAL_ENABLED:
+            full_document_text = "\n\n".join([s.get('content', '') for s in segments])
+            chunks = self._apply_contextual_retrieval(chunks, filename, full_document_text)
+
+        # 3. 최종 메타데이터 강화 + Graph RAG 플래그 (단일 루프로 통합)
+        _numbered_section_re = re.compile(r'###?\s*\d{2}\.')
         total = len(chunks)
+        table_count = 0
+        image_count = 0
+
         for i, chunk in enumerate(chunks):
+            content = chunk.page_content
+            is_table = chunk.metadata.get('is_table_data', False)
+            is_image = chunk.metadata.get('is_image_data', False)
+
+            # 메타데이터 강화
             chunk.metadata = self._enrich_metadata(
                 chunk.metadata,
                 chunk_index=i,
                 total_chunks=total,
-                chunk_text=chunk.page_content,
+                chunk_text=content,
                 section_title=chunk.metadata.get("breadcrumb", "")
             )
 
-            # 청크 유형별 추가 정보
-            content = chunk.page_content
+            # 청크 유형별 추가 정보 (조건 통합)
+            if is_table:
+                table_count += 1
+            elif is_image:
+                image_count += 1
+            else:
+                # v4.0: Graph RAG 대상 플래그 (텍스트 청크만)
+                chunk.metadata['graph_rag_eligible'] = True
+
             if '> **[이미지/차트 설명' in content:
                 chunk.metadata['contains_image_desc'] = True
-            if re.search(r'###?\s*\d{2}\.', content):
+            if _numbered_section_re.search(content):
                 chunk.metadata['contains_numbered_section'] = True
             if '|' in content and '---' in content:
                 chunk.metadata['contains_table'] = True
 
-        # 청크 유형별 통계
-        table_chunks = sum(1 for c in chunks if c.metadata.get('is_table_data'))
-        image_chunks = sum(1 for c in chunks if c.metadata.get('is_image_data'))
-        text_chunks = total - table_chunks - image_chunks
-
+        text_count = total - table_count - image_count
         print(f"   ✅ Generated {total} chunks")
-        print(f"      - Text chunks: {text_chunks}")
-        print(f"      - Table chunks: {table_chunks}")
-        print(f"      - Image chunks: {image_chunks}")
-
-        # v4.0: Graph RAG 대상 플래그 (텍스트 청크만)
-        for c in chunks:
-            if not c.metadata.get('is_table_data') and not c.metadata.get('is_image_data'):
-                c.metadata['graph_rag_eligible'] = True
+        print(f"      - Text chunks: {text_count}")
+        print(f"      - Table chunks: {table_count}")
+        print(f"      - Image chunks: {image_count}")
 
         return chunks
 
@@ -317,69 +367,169 @@ class AdaptiveChunker:
         # 4. Fallback
         return ChunkingStrategy.FALLBACK
 
-    def _generate_context(self, chunk_text: str, filename: str) -> str:
-        """Contextual Retrieval: 청크의 문맥을 LLM을 통해 생성합니다."""
+    def _generate_context(self, chunk_text: str, filename: str, full_document_text: str = "", _doc_preview: str = "") -> str:
+        """
+        Contextual Retrieval (Anthropic 방식): 청크의 문맥을 LLM을 통해 생성합니다.
+
+        전체 문서 맥락을 참조하여 각 청크가 독립적으로도 이해될 수 있도록
+        간결한 맥락 설명을 생성합니다.
+
+        Args:
+            chunk_text: 청크 텍스트
+            filename: 문서 파일명
+            full_document_text: 전체 문서 텍스트 (맥락 참조용)
+            _doc_preview: 사전 생성된 문서 프리뷰 (호출자가 전달 시 재계산 방지)
+
+        Returns:
+            청크의 맥락 설명 텍스트
+        """
+        if not self.model_manager:
+            return ""
+
         try:
+            # 전체 문서가 너무 길면 앞부분만 사용 (토큰 절약)
+            doc_preview = _doc_preview or (full_document_text[:8000] if full_document_text else "")
+
             system_prompt = (
-                "You are a legal expert assistant.\n"
-                f"The following is a section from a document named '{filename}'.\n"
-                "Please read the section and explain its specific context in 2-3 sentences.\n"
-                "Focus on identifying the legal principle, the court's reasoning, or the specific subject matter being discussed.\n"
-                "Do not just repeat the text, but contextualize it so it can be understood in isolation."
+                "당신은 문서 분석 전문가입니다. "
+                "청크의 검색 검색을 개선하기 위해 전체 문서 내에서 이 청크를 위치시키는 "
+                "짧고 간결한 맥락을 한국어로 제공해 주세요.\n"
+                "규칙:\n"
+                "1. 간결한 맥락만 답하고 다른 것은 없습니다.\n"
+                "2. 2-3문장으로 청크가 어떤 문서의 어떤 부분인지, 핵심 주제가 무엇인지 설명하세요.\n"
+                "3. 문서명, 관련 엔티티(회사명, 인명, 제품명 등), 기간 정보를 반드시 포함하세요.\n"
+                "4. 청크 텍스트를 반복하지 말고, 맥락적 정보만 제공하세요."
             )
 
-            user_prompt = f"Section Content:\n{chunk_text}\n\nContext Explanation:"
+            user_prompt = (
+                f"<document>\n{doc_preview}\n</document>\n\n"
+                f"여기에 전체 문서 내에서 위치시키고자 하는 청크가 있습니다:\n"
+                f"<chunk>\n{chunk_text[:2000]}\n</chunk>\n\n"
+                f"문서명: {filename}\n"
+                f"청크의 검색 검색을 개선하기 위해 전체 문서 내에서 이 청크를 위치시키는 "
+                f"짧고 간결한 맥락을 한국어로 제공해 주세요. 간결한 맥락만 답하고 다른 것은 없습니다."
+            )
 
             context = self.model_manager.get_completion(
                 prompt=user_prompt,
                 system_message=system_prompt,
-                model_key="gpt-4o", # 기본적으로 고성능 모델 사용
-                temperature=0
+                model_key=Config.CONTEXTUAL_RETRIEVAL_MODEL,
+                temperature=0,
+                max_tokens=Config.CONTEXTUAL_RETRIEVAL_MAX_TOKENS
             )
             return context.strip()
         except Exception as e:
             print(f"⚠️ Context Generation Failed: {e}")
             return ""
 
-    def _chunk_legal(self, segments: List[Dict[str, Any]], extra_metadata: Dict[str, Any], filename: str) -> List[Document]:
-        """Strategy A: Regex-based split for Legal documents + Contextual Retrieval"""
-        print("   ⚖️ Strategy: LEGAL (Regex Split + Contextual Retrieval + Overlap)")
+    def _apply_contextual_retrieval(
+        self,
+        chunks: List[Document],
+        filename: str,
+        full_document_text: str
+    ) -> List[Document]:
+        """
+        Contextual Retrieval (Anthropic 방식): 모든 청크에 문서 맥락을 앞에 추가합니다.
 
-        # 1. 1차 통합
+        맥락이 추가된 청크는:
+        - BM25 키워드 검색 시 맥락 정보로 정확도 향상 (Contextual BM25)
+        - 벡터 임베딩 시 맥락 정보 포함으로 유사성 검색 향상 (Contextual Embeddings)
+
+        Args:
+            chunks: 청크 리스트
+            filename: 문서 파일명
+            full_document_text: 전체 문서 텍스트
+
+        Returns:
+            맥락이 추가된 청크 리스트
+        """
+        if not self.model_manager:
+            return chunks
+
+        indexed_text_chunks = [
+            (index, chunk)
+            for index, chunk in enumerate(chunks)
+            if not chunk.metadata.get('is_table_data') and not chunk.metadata.get('is_image_data')
+        ]
+
+        if not indexed_text_chunks:
+            return chunks
+
+        batch_size = Config.CONTEXTUAL_RETRIEVAL_BATCH_SIZE
+        total = len(indexed_text_chunks)
+        print(f"   🧠 Contextual Retrieval: {total}개 텍스트 청크에 맥락 추가 중... (batch_size={batch_size})")
+
+        doc_preview = full_document_text[:8000] if full_document_text else ""
+
+        def _generate_and_apply(indexed_chunk):
+            """단일 청크에 맥락을 생성하고 적용하는 워커 함수"""
+            idx, chunk = indexed_chunk
+            context = self._generate_context(
+                chunk_text=chunk.page_content,
+                filename=filename,
+                full_document_text=full_document_text,
+                _doc_preview=doc_preview
+            )
+            return idx, context
+
+        contexts_by_index: Dict[int, str] = {}
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = {
+                executor.submit(_generate_and_apply, indexed_chunk): indexed_chunk[0]
+                for indexed_chunk in indexed_text_chunks
+            }
+            completed = 0
+            for future in as_completed(futures):
+                idx, context = future.result()
+                contexts_by_index[idx] = context
+                completed += 1
+                if completed % batch_size == 0 or completed == total:
+                    print(f"      📝 맥락 생성 완료: {completed}/{total}")
+
+        success_count = 0
+        for index, chunk in indexed_text_chunks:
+            context = contexts_by_index.get(index)
+            if context:
+                chunk.metadata['original_chunk'] = chunk.page_content
+                chunk.metadata['context'] = context
+                chunk.metadata['has_contextual_retrieval'] = True
+                chunk.page_content = f"[맥락: {context}]\n\n{chunk.page_content}"
+                success_count += 1
+            else:
+                chunk.metadata['has_contextual_retrieval'] = False
+
+        print(f"   ✅ Contextual Retrieval 완료: {success_count}/{total}개 청크에 맥락 추가")
+        return chunks
+
+    def _chunk_legal(self, segments: List[Dict[str, Any]], extra_metadata: Dict[str, Any], filename: str) -> List[Document]:
+        """Strategy A: Regex-based split for Legal documents"""
+        print("   \u2696\ufe0f Strategy: LEGAL (Regex Split + Overlap)")
+
+        # 1. 1\ucc28 \ud1b5\ud569
         full_text = "\n\n".join([s['content'] for s in segments])
 
-        # 2. Regex Split (판례 구조 기반 - 【주문】, 【이유】 등)
-        split_pattern = r"(?=【.*?】)"
+        # 2. Regex Split (\ud310\ub840 \uad6c\uc870 \uae30\ubc18 - \u3010\uc8fc\ubb38\u3011, \u3010\uc774\uc720\u3011 \ub4f1)
+        split_pattern = r"(?=\u3010.*?\u3011)"
         raw_chunks = re.split(split_pattern, full_text)
 
         final_chunks = []
-        print(f"      👉 Splitting into {len(raw_chunks)} raw blocks...")
+        print(f"      \ud83d\udc49 Splitting into {len(raw_chunks)} raw blocks...")
 
         for i, raw_text in enumerate(raw_chunks):
             if not raw_text.strip(): continue
 
-            # 토큰 수 체크 - 너무 크면 추가 분할
+            # \ud1a0\ud070 \uc218 \uccb4\ud06c - \ub108\ubb34 \ud06c\uba74 \ucd94\uac00 \ubd84\ud560
             if self._count_tokens(raw_text) > self.config.max_tokens:
                 sub_chunks = self._split_with_overlap(raw_text)
                 for j, sub_chunk in enumerate(sub_chunks):
                     meta = extra_metadata.copy()
-                    meta['strategy'] = 'legal_contextual'
+                    meta['strategy'] = 'legal'
                     meta['sub_chunk'] = f"{i+1}.{j+1}"
                     final_chunks.append(Document(page_content=sub_chunk, metadata=meta))
             else:
-                # 3. Contextual Retrieval (LLM 호출) - 비용 절감을 위해 첫 5개만
-                context = ""
-                if i < 5:
-                    print(f"      🤖 Generating context for chunk {i+1}...")
-                    context = self._generate_context(raw_text[:1000], filename)
-
-                content_with_context = raw_text
-                if context:
-                    content_with_context = f"[Context: {context}]\n\n{raw_text}"
-
                 meta = extra_metadata.copy()
-                meta['strategy'] = 'legal_contextual'
-                final_chunks.append(Document(page_content=content_with_context, metadata=meta))
+                meta['strategy'] = 'legal'
+                final_chunks.append(Document(page_content=raw_text, metadata=meta))
 
         return final_chunks
 

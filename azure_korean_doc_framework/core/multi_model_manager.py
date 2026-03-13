@@ -1,14 +1,27 @@
 from typing import Optional, Dict, Any
+from functools import lru_cache
 from ..config import Config
 from ..utils.azure_clients import AzureClientFactory
 
+
+@lru_cache(maxsize=32)
+def _classify_model(key: str) -> tuple:
+    """
+    모델 키의 분류 정보를 캐싱하여 반환합니다.
+    (is_advanced, is_gpt5_series, is_reasoning_model) 튜플 반환.
+    """
+    is_advanced = key in Config.ADVANCED_MODELS
+    is_gpt5_series = key.startswith("gpt-5") or key.startswith("o3") or key.startswith("o4")
+    is_reasoning = key in Config.REASONING_MODELS
+    return is_advanced, is_gpt5_series, is_reasoning
+
 class MultiModelManager:
     """
-    GPT-5.2, GPT-4.1, Claude 등 다양한 모델에 대한 API 호출을 통합 관리하는 클래스입니다.
+    GPT-5.4, GPT-4.1, Claude 등 다양한 모델에 대한 API 호출을 통합 관리하는 클래스입니다.
     모델 키에 따라 적절한 Azure OpenAI 엔드포인트 및 배포판으로 요청을 라우팅합니다.
 
     [2026-01 업데이트]
-    - GPT-5.2 기본 모델 지원
+    - GPT-5.4 기본 모델 지원
     - Structured Outputs 지원
     - max_completion_tokens 파라미터 사용 (GPT-5.x)
     - reasoning_effort 파라미터 지원 (추론 모델)
@@ -44,8 +57,8 @@ class MultiModelManager:
         key = model_key or self.default_model
         model_name = Config.MODELS.get(key)
 
-        # 고성능 모델(Advanced) 여부 확인 (Config.ADVANCED_MODELS 기준)
-        is_advanced = key in getattr(Config, "ADVANCED_MODELS", [])
+        # 캐시된 모델 분류 정보 활용 (매 호출마다 재계산 방지)
+        is_advanced, is_gpt5_series, is_reasoning_model = _classify_model(key)
 
         # 해당 그룹(일반/고성능)에 맞는 최적화된 클라이언트 획득 (캐시 활용)
         client = AzureClientFactory.get_openai_client(is_advanced=is_advanced)
@@ -54,14 +67,9 @@ class MultiModelManager:
             print(f"⚠️ 모델 키 '{model_key}'를 찾을 수 없어 기본 모델 '{self.default_model}'을 사용합니다.")
             model_name = Config.MODELS.get(self.default_model)
             key = self.default_model
-
-        # GPT-5.x 여부 확인 (max_completion_tokens 사용 모델)
-        # o-시리즈도 GPT-5.x와 동일한 API 파라미터 사용
-        is_gpt5_series = key.startswith("gpt-5") or key.startswith("o3") or key.startswith("o4")
-        is_reasoning_model = key in Config.REASONING_MODELS
+            is_advanced, is_gpt5_series, is_reasoning_model = _classify_model(key)
 
         print(f"🤖 LLM 호출 중: {key} (배포명: {model_name}, 고성능: {is_advanced}, GPT-5.x: {is_gpt5_series})")
-
         try:
             # 기본 파라미터 구성
             completion_params = {

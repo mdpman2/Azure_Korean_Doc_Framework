@@ -5,7 +5,7 @@ LightRAG(https://github.com/HKUDS/LightRAG)의 핵심 개념을 참조하여 구
 경량 Knowledge Graph 기반 RAG 시스템입니다.
 
 핵심 기능:
-- GPT-5.2를 활용한 엔티티/관계 추출 (한국어 최적화)
+- GPT-5.4를 활용한 엔티티/관계 추출 (한국어 최적화)
 - NetworkX 기반 인메모리 Knowledge Graph
 - Dual-Level Retrieval (Local: 엔티티 중심, Global: 관계 중심)
 - 벡터 검색과 그래프 검색의 하이브리드 결합
@@ -158,7 +158,7 @@ class KnowledgeGraphManager:
     LightRAG-inspired Knowledge Graph 관리자
 
     LightRAG의 핵심 아키텍처를 참조하여 구현:
-    - 엔티티/관계 추출 (GPT-5.2)
+    - 엔티티/관계 추출 (GPT-5.4)
     - NetworkX 기반 인메모리 그래프
     - Dual-Level Retrieval (Local + Global)
     - 한국어 문서 특화
@@ -169,7 +169,7 @@ class KnowledgeGraphManager:
     def __init__(
         self,
         entity_types: Optional[List[str]] = None,
-        model_key: str = "gpt-5.2",
+        model_key: str = "gpt-5.4",
         max_entities_per_chunk: int = 20,
     ):
         if not HAS_NETWORKX:
@@ -190,6 +190,10 @@ class KnowledgeGraphManager:
         # 엔티티/관계 캐시 (중복 방지)
         self._entity_cache: Dict[str, Entity] = {}
         self._chunk_to_entities: Dict[str, List[str]] = {}
+
+        # 역색인: 키워드 → 엔티티/관계 빠른 검색용 (O(N*K) → O(K))
+        self._entity_keyword_index: Dict[str, set] = {}  # keyword → {entity_name, ...}
+        self._relation_keyword_index: Dict[str, set] = {}  # keyword → {(source, target), ...}
 
         print(f"📊 KnowledgeGraphManager 초기화 (모델: {model_key}, 엔티티 타입: {len(self.entity_types)}개)")
 
@@ -294,7 +298,7 @@ class KnowledgeGraphManager:
         return all_entities, all_relationships
 
     def _add_entity(self, entity: Entity) -> None:
-        """엔티티를 그래프에 추가 (중복 시 병합)"""
+        """엔티티를 그래프에 추가 (중복 시 병합) + 역색인 업데이트"""
         name = entity.name
 
         if name in self._entity_cache:
@@ -316,8 +320,15 @@ class KnowledgeGraphManager:
                 source_count=len(entity.source_chunks),
             )
 
+        # 역색인 업데이트: 엔티티명과 description의 토큰을 인덱싱
+        desc = entity.description or ""
+        for token in set(name.split() + desc.split()):
+            token = token.strip()
+            if token:
+                self._entity_keyword_index.setdefault(token, set()).add(name)
+
     def _add_relationship(self, rel: Relationship) -> None:
-        """관계를 그래프에 추가 (중복 시 가중치 합산)"""
+        """관계를 그래프에 추가 (중복 시 가중치 합산) + 역색인 업데이트"""
         if self.graph.has_edge(rel.source, rel.target):
             # 기존 관계에 가중치 합산
             self.graph[rel.source][rel.target]["weight"] += rel.weight
@@ -339,6 +350,14 @@ class KnowledgeGraphManager:
                 weight=rel.weight,
                 keywords=rel.keywords,
             )
+
+        # 역색인 업데이트: 관계 description/keywords/type 인덱싱
+        edge_key = (rel.source, rel.target)
+        for text in [rel.description, rel.keywords, rel.relation_type]:
+            for token in text.split():
+                token = token.strip().strip(",")
+                if token:
+                    self._relation_keyword_index.setdefault(token, set()).add(edge_key)
 
     # ==================== Dual-Level Retrieval ====================
 
@@ -433,21 +452,30 @@ class KnowledgeGraphManager:
         keywords: List[str],
         top_k: int,
     ) -> Tuple[List[Entity], List[Relationship]]:
-        """Local Search: 엔티티 중심 (Low-Level Keywords 사용)"""
+        """Local Search: 엔티티 중심 (Low-Level Keywords 사용) — 역색인 기반 O(K) 검색"""
         matched_entities = []
         seen_entity_names: set = set()
         rel_map: Dict[Tuple[str, str], Relationship] = {}
 
         for keyword in keywords:
-            for node_name, node_data in self.graph.nodes(data=True):
-                if keyword in node_name or keyword in node_data.get("description", ""):
-                    if node_name not in seen_entity_names:
-                        seen_entity_names.add(node_name)
-                        matched_entities.append(Entity(
-                            name=node_name,
-                            entity_type=node_data.get("entity_type", ""),
-                            description=node_data.get("description", ""),
-                        ))
+            # 역색인에서 정확한 토큰 매칭
+            candidate_names = self._entity_keyword_index.get(keyword, set())
+
+            # 엔티티명 부분 문자열 매칭도 지원 (역색인에 없을 경우)
+            if not candidate_names:
+                for node_name in self.graph.nodes:
+                    if keyword in node_name:
+                        candidate_names = candidate_names | {node_name}
+
+            for node_name in candidate_names:
+                if node_name not in seen_entity_names and self.graph.has_node(node_name):
+                    seen_entity_names.add(node_name)
+                    node_data = self.graph.nodes[node_name]
+                    matched_entities.append(Entity(
+                        name=node_name,
+                        entity_type=node_data.get("entity_type", ""),
+                        description=node_data.get("description", ""),
+                    ))
 
                     # 엔티티의 직접 관계 수집 (out + in edges)
                     for _, target, edge_data in self.graph.out_edges(node_name, data=True):
@@ -482,24 +510,31 @@ class KnowledgeGraphManager:
         keywords: List[str],
         top_k: int,
     ) -> Tuple[List[Entity], List[Relationship]]:
-        """Global Search: 관계/주제 중심 (High-Level Keywords 사용)"""
+        """Global Search: 관계/주제 중심 (High-Level Keywords 사용) — 역색인 기반 O(K) 검색"""
         matched_relationships = []
 
         for keyword in keywords:
-            # 관계의 description/keywords에서 매칭
-            for source, target, edge_data in self.graph.edges(data=True):
-                desc = edge_data.get("description", "")
-                kw = edge_data.get("keywords", "")
-                rel_type = edge_data.get("relation_type", "")
+            # 역색인에서 정확한 토큰 매칭
+            candidate_edges = self._relation_keyword_index.get(keyword, set())
 
-                if keyword in desc or keyword in kw or keyword in rel_type:
+            # 역색인에 없으면 전체 검색 폴백
+            if not candidate_edges:
+                for source, target, edge_data in self.graph.edges(data=True):
+                    desc = edge_data.get("description", "")
+                    kw = edge_data.get("keywords", "")
+                    if keyword in desc or keyword in kw:
+                        candidate_edges = candidate_edges | {(source, target)}
+
+            for source, target in candidate_edges:
+                if self.graph.has_edge(source, target):
+                    edge_data = self.graph[source][target]
                     rel = Relationship(
                         source=source,
                         target=target,
-                        relation_type=rel_type,
-                        description=desc,
+                        relation_type=edge_data.get("relation_type", ""),
+                        description=edge_data.get("description", ""),
                         weight=edge_data.get("weight", 1.0),
-                        keywords=kw,
+                        keywords=edge_data.get("keywords", ""),
                     )
                     matched_relationships.append(rel)
 
@@ -657,14 +692,20 @@ class KnowledgeGraphManager:
             data = json.load(f)
 
         self.graph.clear()
+        self._entity_keyword_index.clear()
+        self._relation_keyword_index.clear()
+        self._entity_cache.clear()
+
         for node in data.get("nodes", []):
-            name = node.pop("name")
-            self.graph.add_node(name, **node)
+            name = node["name"]
+            attrs = {k: v for k, v in node.items() if k != "name"}
+            self.graph.add_node(name, **attrs)
 
         for edge in data.get("edges", []):
-            source = edge.pop("source")
-            target = edge.pop("target")
-            self.graph.add_edge(source, target, **edge)
+            source = edge["source"]
+            target = edge["target"]
+            attrs = {k: v for k, v in edge.items() if k not in ("source", "target")}
+            self.graph.add_edge(source, target, **attrs)
 
         print(f"📁 Knowledge Graph 로드 완료: 노드 {self.graph.number_of_nodes()}개, "
               f"엣지 {self.graph.number_of_edges()}개")
@@ -674,4 +715,6 @@ class KnowledgeGraphManager:
         self.graph.clear()
         self._entity_cache.clear()
         self._chunk_to_entities.clear()
+        self._entity_keyword_index.clear()
+        self._relation_keyword_index.clear()
         print("🗑️ Knowledge Graph 초기화 완료")

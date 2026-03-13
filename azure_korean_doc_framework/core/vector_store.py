@@ -23,6 +23,12 @@ class VectorStore:
     Azure AI Search 기반의 벡터 저장소 관리 클래스.
 
     인덱스 생성, 문서 벡터화(임베딩), 검색 및 증분 업데이트 관리를 담당합니다.
+    기본 스키마를 생성할 수 있으며, 기존 인덱스도 Config.SEARCH_* 필드 매핑으로 재사용할 수 있습니다.
+
+    [v4.1 업데이트 - Contextual Retrieval]
+    - SEARCH_CONTENT_FIELD: 맥락 포함 텍스트 (BM25 키워드 + 벡터 임베딩 대상)
+    - SEARCH_ORIGINAL_CONTENT_FIELD: 원본 텍스트 (답변 생성 시 사용)
+    - SEARCH_VECTOR_FIELD: 맥락 포함 텍스트 기반 Contextual Embeddings
     """
 
     def __init__(self, index_name: Optional[str] = None):
@@ -45,13 +51,54 @@ class VectorStore:
         # 인덱스 초기화 및 필드/시맨틱 설정 자동 보정
         self._ensure_incremental_fields()
 
+    def _semantic_configuration(self) -> SemanticConfiguration:
+        return SemanticConfiguration(
+            name=Config.SEARCH_SEMANTIC_CONFIG,
+            prioritized_fields=SemanticPrioritizedFields(
+                title_field=SemanticField(field_name=Config.SEARCH_TITLE_FIELD),
+                content_fields=[SemanticField(field_name=Config.SEARCH_CONTENT_FIELD)],
+            ),
+        )
+
+    def _build_document_id(self, parent_id: str, index: int) -> str:
+        parent_hash = hashlib.md5(parent_id.encode('utf-8')).hexdigest()[:10]
+        return f"c_{parent_hash}_{index}"
+
+    def _base_document_fields(self, vector_dim: int):
+        return [
+            SimpleField(name=Config.SEARCH_ID_FIELD, type=SearchFieldDataType.String, key=True),
+            SimpleField(name=Config.SEARCH_PARENT_FIELD, type=SearchFieldDataType.String, filterable=True, facetable=True),
+            SimpleField(name="last_modified", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="content_hash", type=SearchFieldDataType.String, filterable=True),
+            SearchField(name=Config.SEARCH_CONTENT_FIELD, type=SearchFieldDataType.String, searchable=True, analyzer_name="ko.microsoft"),
+            SearchField(name=Config.SEARCH_ORIGINAL_CONTENT_FIELD, type=SearchFieldDataType.String, searchable=True),
+            SearchField(name=Config.SEARCH_TITLE_FIELD, type=SearchFieldDataType.String, searchable=True),
+            SearchField(
+                name=Config.SEARCH_VECTOR_FIELD,
+                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                searchable=True,
+                vector_search_dimensions=vector_dim,
+                vector_search_profile_name="my-vector-profile",
+            ),
+        ]
+
+    @staticmethod
+    def _batched(items: List[Any], batch_size: int):
+        for start in range(0, len(items), batch_size):
+            yield items[start:start + batch_size]
+
     def create_index_if_not_exists(self, vector_dim: int = 1536) -> None:
         """
         AI Search 인덱스가 존재하지 않으면 생성합니다.
-        벡터 검색 및 시맨틱 랭킹(Semantic Ranking) 설정을 포함합니다.
+        벡터 검색, 시맨틱 랭킹(Semantic Ranking), Contextual Retrieval 필드를 포함합니다.
+
+        인덱스 필드 구성 (v4.1):
+        - Config.SEARCH_CONTENT_FIELD: 맥락 포함된 텍스트 (BM25 키워드 검색 + ko.microsoft 분석기)
+        - Config.SEARCH_ORIGINAL_CONTENT_FIELD: 원본 텍스트 (답변 생성용, 맥락 제외)
+        - Config.SEARCH_VECTOR_FIELD: 맥락 포함된 텍스트의 Contextual Embeddings
 
         Args:
-            vector_dim: 벡터 필드의 차원 수 (기본값: 1536 - text-embedding-ada-002 기준).
+            vector_dim: 벡터 필드의 차원 수 (기본값: 1536 - text-embedding-3-small 기준).
         """
         try:
             self.index_client.get_index(self.index_name)
@@ -59,16 +106,7 @@ class VectorStore:
         except Exception: # Changed from bare except
             print(f"🛠️ 인덱스 생성 중: '{self.index_name}'...")
 
-            fields = [
-                SimpleField(name="chunk_id", type=SearchFieldDataType.String, key=True),
-                SimpleField(name="parent_id", type=SearchFieldDataType.String, filterable=True, facetable=True),
-                SimpleField(name="last_modified", type=SearchFieldDataType.String, filterable=True),
-                SimpleField(name="content_hash", type=SearchFieldDataType.String, filterable=True),
-                SearchField(name="chunk", type=SearchFieldDataType.String, searchable=True, analyzer_name="ko.microsoft"),
-                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
-                SearchField(name="text_vector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
-                            searchable=True, vector_search_dimensions=vector_dim, vector_search_profile_name="my-vector-profile"),
-            ]
+            fields = self._base_document_fields(vector_dim)
 
             # 벡터 검색 알고리즘 및 프로필 설정
             vector_search = VectorSearch(
@@ -77,17 +115,7 @@ class VectorStore:
             )
 
             # 시맨틱 검색 설정 (한국어 검색 품질 향상)
-            semantic_search = SemanticSearch(
-                configurations=[
-                    SemanticConfiguration(
-                        name="my-semantic-config",
-                        prioritized_fields=SemanticPrioritizedFields(
-                            title_field=None,
-                            content_fields=[SemanticField(field_name="chunk")]
-                        )
-                    )
-                ]
-            )
+            semantic_search = SemanticSearch(configurations=[self._semantic_configuration()])
 
             index = SearchIndex(
                 name=self.index_name,
@@ -101,12 +129,20 @@ class VectorStore:
 
     def _ensure_incremental_fields(self) -> None:
         """
-        기존 인덱스 스키마에 증분 업데이트용 필드 및 시맨틱 검색 설정이 없으면 동적으로 추가합니다.
+        기존 인덱스 스키마에 증분 업데이트용 필드, 시맨틱 검색 설정,
+        그리고 원본 텍스트/부모 문서 추적 필드가 없으면 동적으로 추가합니다.
         """
         try:
             index = self.index_client.get_index(self.index_name)
             field_names = [f.name for f in index.fields]
             updated = False
+
+            if Config.SEARCH_PARENT_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_PARENT_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(
+                    SimpleField(name=Config.SEARCH_PARENT_FIELD, type=SearchFieldDataType.String, filterable=True, facetable=True)
+                )
+                updated = True
 
             if "last_modified" not in field_names:
                 print(f"🛠️ 'last_modified' 필드 추가 중: {self.index_name}")
@@ -118,20 +154,20 @@ class VectorStore:
                 index.fields.append(SimpleField(name="content_hash", type=SearchFieldDataType.String, filterable=True))
                 updated = True
 
-            # 시맨틱 검색 설정 확인 및 추가
-            if not index.semantic_search or not any(c.name == "my-semantic-config" for c in index.semantic_search.configurations):
-                print(f"🛠️ 'my-semantic-config' 시맨틱 검색 설정 추가 중: {self.index_name}")
-                index.semantic_search = SemanticSearch(
-                    configurations=[
-                        SemanticConfiguration(
-                            name="my-semantic-config",
-                            prioritized_fields=SemanticPrioritizedFields(
-                                title_field=None,
-                                content_fields=[SemanticField(field_name="chunk")]
-                            )
-                        )
-                    ]
+            # v4.1: 원본 텍스트 보존 필드 동적 추가
+            if Config.SEARCH_ORIGINAL_CONTENT_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_ORIGINAL_CONTENT_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(
+                    SearchField(name=Config.SEARCH_ORIGINAL_CONTENT_FIELD, type=SearchFieldDataType.String, searchable=True)
                 )
+                updated = True
+
+            # 시맨틱 검색 설정 확인 및 추가
+            if not index.semantic_search or not any(
+                c.name == Config.SEARCH_SEMANTIC_CONFIG for c in index.semantic_search.configurations
+            ):
+                print(f"🛠️ '{Config.SEARCH_SEMANTIC_CONFIG}' 시맨틱 검색 설정 추가 중: {self.index_name}")
+                index.semantic_search = SemanticSearch(configurations=[self._semantic_configuration()])
                 updated = True
 
             if updated:
@@ -145,22 +181,27 @@ class VectorStore:
         문서 청크를 벡터화하여 AI Search에 업로드합니다.
         배치 임베딩을 통해 API 호출 횟수를 최적화하며, 고유 ID 생성을 통해 충돌을 방지합니다.
 
+        [v4.1 Contextual Retrieval]
+        - Config.SEARCH_CONTENT_FIELD: 맥락 포함 텍스트 (BM25 키워드 + Contextual BM25)
+        - Config.SEARCH_ORIGINAL_CONTENT_FIELD: 원본 텍스트 (맥락 제외, 답변 생성용)
+        - Config.SEARCH_VECTOR_FIELD: 맥락 포함 텍스트 기반 Contextual Embeddings
+
         Args:
-            chunks: 업로드할 LangChain Document 객체 리스트.
+            chunks: 업로드할 Document 객체 리스트.
         """
         if not chunks:
             return
 
         print(f"📡 {len(chunks)}개 청크 배치 임베딩 및 업로드 중... 인덱스: '{self.index_name}'")
 
-        # 1. 문서 텍스트 추출 및 한꺼번에 임베딩 (성능 최적화 핵심)
+        # 1. 문서 텍스트 추출 (Contextual Retrieval: 맥락이 포함된 텍스트로 임베딩)
+        # page_content에는 맥락이 이미 포함되어 있음 (Contextual Embeddings + Contextual BM25)
         texts = [chunk.page_content for chunk in chunks]
 
-        # self.embeddings.embed_documents(texts) 대신 native SDK 사용 (배치당 16개 권장되나 50개도 대개 허용됨)
+        # 배치 임베딩 (한 번에 2048개까지 처리 가능하나, API 안정성을 위해 50개 단위 처리)
         vectors = []
-        batch_size = 16 # 보다 안정적인 배치를 일괄 적용
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
+        batch_size = 50
+        for batch_texts in self._batched(texts, batch_size):
             response = self.openai_client.embeddings.create(
                 input=batch_texts,
                 model=Config.EMBEDDING_DEPLOYMENT
@@ -172,22 +213,23 @@ class VectorStore:
         for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
             # 파일명과 인덱스를 조합하여 고유 ID 생성 (중복 방지)
             parent_id_str = str(chunk.metadata.get("source", "unknown"))
-            # Encode parent_id to handle non-ascii chars safely in hash
-            parent_hash = hashlib.md5(parent_id_str.encode('utf-8')).hexdigest()[:10]
-
-            documents.append({
-                "chunk_id": f"c_{parent_hash}_{i}", # Short unique prefix
-                "chunk": chunk.page_content,
-                "title": chunk.metadata.get("Header 1", "No Title"),
-                "parent_id": parent_id_str,
+            title = str(chunk.metadata.get("Header 1") or parent_id_str or "No Title")
+            document = {
+                Config.SEARCH_ID_FIELD: self._build_document_id(parent_id_str, i),
+                Config.SEARCH_CONTENT_FIELD: chunk.page_content,
+                Config.SEARCH_ORIGINAL_CONTENT_FIELD: chunk.metadata.get("original_chunk", chunk.page_content),
+                Config.SEARCH_TITLE_FIELD: title,
+                Config.SEARCH_PARENT_FIELD: parent_id_str,
                 "last_modified": str(chunk.metadata.get("last_modified", "")),
                 "content_hash": str(chunk.metadata.get("content_hash", "")),
-                "text_vector": vector
-            })
+                Config.SEARCH_VECTOR_FIELD: vector,
+            }
+            if Config.SEARCH_SOURCE_FIELD not in document:
+                document[Config.SEARCH_SOURCE_FIELD] = title
+            documents.append(document)
 
         # 3. 50개 단위로 나누어 업로드 (배치 처리)
-        for j in range(0, len(documents), 50):
-            batch = documents[j:j+50]
+        for batch in self._batched(documents, 50):
             self.search_client.upload_documents(batch)
 
         print(f"✅ {len(documents)}개 업로드 완료.")
@@ -206,9 +248,10 @@ class VectorStore:
             최신 상태이면 True, 아니면 False.
         """
         try:
+            # filter-only 검색 최적화: search_text 없이 필터만 사용
             results = self.search_client.search(
-                search_text="*",
-                filter=f"parent_id eq '{file_name}'",
+                search_text=None,
+                filter=f"{Config.SEARCH_PARENT_FIELD} eq '{file_name}'",
                 select=["last_modified", "content_hash"],
                 top=1
             )
@@ -231,23 +274,24 @@ class VectorStore:
 
     def delete_documents_by_parent_id(self, parent_id: str) -> None:
         """
-        특정 파일(parent_id)에 연관된 모든 청크 데이터를 삭제합니다 (업데이트 전 처리용).
+        특정 파일(parent_id)에 연관된 모든 청크 데이터를 삭제합니다.
+        실제 필터링에는 Config.SEARCH_PARENT_FIELD를 사용합니다.
 
         Args:
             parent_id: 삭제할 부모 문서 ID(파일명).
         """
         try:
+            # filter-only 검색 최적화: search_text 없이 필터만 사용
             results = self.search_client.search(
-                search_text="*",
-                filter=f"parent_id eq '{parent_id}'",
-                select=["chunk_id"]
+                search_text=None,
+                filter=f"{Config.SEARCH_PARENT_FIELD} eq '{parent_id}'",
+                select=[Config.SEARCH_ID_FIELD]
             )
 
-            ids_to_delete = [{"chunk_id": r["chunk_id"]} for r in results]
+            ids_to_delete = [{Config.SEARCH_ID_FIELD: r[Config.SEARCH_ID_FIELD]} for r in results]
             if ids_to_delete:
                 print(f"🗑️ 기존 데이터 삭제 중: '{parent_id}' ({len(ids_to_delete)}개 청크)")
-                for i in range(0, len(ids_to_delete), 100):
-                    batch = ids_to_delete[i:i+100]
+                for batch in self._batched(ids_to_delete, 100):
                     self.search_client.delete_documents(batch)
                 print("✅ 삭제 완료.")
         except Exception as e:
