@@ -1,6 +1,6 @@
 import json
 import hashlib
-from typing import List, Tuple, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from azure.search.documents.models import VectorizedQuery
 from .multi_model_manager import MultiModelManager
 from .schema import AnswerArtifacts, PipelineStep, SearchResult
@@ -66,8 +66,8 @@ class KoreanDocAgent:
         # LLM 클라이언트 (Query Rewrite용) - 고성능 엔드포인트
         self.llm_client = AzureClientFactory.get_openai_client(is_advanced=True)
 
-        # Query Rewrite 활성화 여부
-        self.enable_query_rewrite = True
+        # Query Rewrite 활성화 여부 (환경 변수로 제어 가능)
+        self.enable_query_rewrite = Config.QUERY_REWRITE_ENABLED
 
         # [v4.0] Graph RAG 매니저 (LightRAG 기반)
         self.graph_manager = graph_manager
@@ -249,6 +249,63 @@ class KoreanDocAgent:
     def _format_contexts(self, results: List[SearchResult]) -> List[str]:
         return [f"[출처: {item.source}]\n{item.content}" for item in results]
 
+    def _build_diagnostics(
+        self,
+        question: str,
+        search_queries: Optional[List[str]],
+        search_results: List[SearchResult],
+        model_key: Optional[str],
+        graph_context_used: bool = False,
+        gate_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not Config.ANSWER_DIAGNOSTICS_ENABLED:
+            return {}
+
+        query_variants = search_queries or [question]
+        top_score = max((item.score for item in search_results), default=0.0)
+        resolved_model_key = model_key or getattr(self.model_manager, "default_model", Config.DEFAULT_MODEL)
+        return {
+            "question_length": len(question),
+            "model_key": resolved_model_key,
+            "query_rewrite_enabled": self.enable_query_rewrite,
+            "query_variant_count": len(query_variants),
+            "query_variants": query_variants,
+            "search_result_count": len(search_results),
+            "top_score": top_score,
+            "top_sources": [item.source for item in search_results[:3]],
+            "graph_context_used": graph_context_used,
+            "gate_reason": gate_reason,
+        }
+
+    def _finalize_artifacts(
+        self,
+        *,
+        question: str,
+        search_queries: Optional[List[str]],
+        search_results: List[SearchResult],
+        answer: str,
+        contexts: Optional[List[str]] = None,
+        steps: Optional[List[PipelineStep]] = None,
+        model_key: Optional[str] = None,
+        graph_context_used: bool = False,
+        gate_reason: Optional[str] = None,
+    ) -> AnswerArtifacts:
+        return AnswerArtifacts(
+            answer=answer,
+            contexts=contexts or [],
+            steps=steps or [],
+            search_results=search_results,
+            gate_reason=gate_reason,
+            diagnostics=self._build_diagnostics(
+                question=question,
+                search_queries=search_queries,
+                search_results=search_results,
+                model_key=model_key,
+                graph_context_used=graph_context_used,
+                gate_reason=gate_reason,
+            ),
+        )
+
     def _generate_standard_answer(
         self,
         question: str,
@@ -270,6 +327,8 @@ class KoreanDocAgent:
         search_results: List[SearchResult],
         model_key: Optional[str] = None,
         system_prompt: str = _RAG_SYSTEM_PROMPT,
+        search_queries: Optional[List[str]] = None,
+        graph_context_used: bool = False,
     ) -> AnswerArtifacts:
         steps: List[PipelineStep] = []
 
@@ -281,10 +340,14 @@ class KoreanDocAgent:
                 detail={"reason": injection.reason, "score": injection.score},
             ))
             if injection.blocked:
-                return AnswerArtifacts(
+                return self._finalize_artifacts(
+                    question=question,
+                    search_queries=search_queries,
+                    search_results=search_results,
                     answer="입력 내용이 안전하지 않아 요청을 처리할 수 없습니다.",
                     steps=steps,
-                    search_results=search_results,
+                    model_key=model_key,
+                    graph_context_used=graph_context_used,
                 )
 
         gate_reason = None
@@ -301,10 +364,14 @@ class KoreanDocAgent:
                 },
             ))
             if not gate_result.passed and not gate_result.soft_fail:
-                return AnswerArtifacts(
+                return self._finalize_artifacts(
+                    question=question,
+                    search_queries=search_queries,
+                    search_results=search_results,
                     answer=Config.RETRIEVAL_GATE_NOT_FOUND_MESSAGE,
                     steps=steps,
-                    search_results=search_results,
+                    model_key=model_key,
+                    graph_context_used=graph_context_used,
                     gate_reason=gate_result.reason,
                 )
             if not gate_result.passed:
@@ -384,11 +451,15 @@ class KoreanDocAgent:
                 },
             ))
 
-        return AnswerArtifacts(
+        return self._finalize_artifacts(
+            question=question,
+            search_queries=search_queries,
+            search_results=search_results,
             answer=answer,
             contexts=contexts,
             steps=steps,
-            search_results=search_results,
+            model_key=model_key,
+            graph_context_used=graph_context_used,
             gate_reason=gate_reason,
         )
 
@@ -416,8 +487,9 @@ class KoreanDocAgent:
         model_key: Optional[str] = None,
         return_context: bool = False,
         top_k: int = 5,
-        use_query_rewrite: bool = True
-    ) -> Union[str, Tuple[str, List[str]]]:
+        use_query_rewrite: bool = True,
+        return_artifacts: bool = False,
+    ) -> Union[str, Tuple[str, List[str]], AnswerArtifacts]:
         """
         사용자의 질문에 대해 검색 증강 생성(RAG)을 수행합니다.
 
@@ -431,10 +503,14 @@ class KoreanDocAgent:
             return_context: True일 경우 답변과 함께 검색된 컨텍스트 리스트를 반환합니다.
             top_k: 검색할 문서의 개수 (기본값: 5).
             use_query_rewrite: Query Rewrite 사용 여부 (기본값: True).
+            return_artifacts: True일 경우 AnswerArtifacts 전체를 반환합니다.
 
         Returns:
             답변 문자열 또는 (답변, 컨텍스트 리스트) 튜플.
         """
+        if return_artifacts and return_context:
+            raise ValueError("return_artifacts 와 return_context 는 동시에 사용할 수 없습니다.")
+
         print(f"🔎 Searching for: {question} (top_k={top_k}, hybrid=BM25+Vector+Semantic)")
 
         # 0. Query Rewrite (선택적) — 공통 로직
@@ -447,8 +523,11 @@ class KoreanDocAgent:
             search_results,
             model_key=model_key,
             system_prompt=_RAG_SYSTEM_PROMPT,
+            search_queries=search_queries,
         )
 
+        if return_artifacts:
+            return artifacts
         if return_context:
             return artifacts.answer, artifacts.contexts
         return artifacts.answer
@@ -463,7 +542,8 @@ class KoreanDocAgent:
         top_k: int = 5,
         use_query_rewrite: bool = True,
         graph_query_mode: str = "hybrid",
-    ) -> Union[str, Tuple[str, List[str]]]:
+        return_artifacts: bool = False,
+    ) -> Union[str, Tuple[str, List[str]], AnswerArtifacts]:
         """
         [v4.0] Graph-Enhanced RAG: 벡터 검색 + Knowledge Graph 결합
 
@@ -479,10 +559,14 @@ class KoreanDocAgent:
             top_k: 검색할 문서의 개수 (기본값: 5).
             use_query_rewrite: Query Rewrite 사용 여부 (기본값: True).
             graph_query_mode: Graph 검색 모드 (local/global/hybrid/naive).
+            return_artifacts: True일 경우 AnswerArtifacts 전체를 반환합니다.
 
         Returns:
             답변 문자열 또는 (답변, 컨텍스트 리스트) 튜플.
         """
+        if return_artifacts and return_context:
+            raise ValueError("return_artifacts 와 return_context 는 동시에 사용할 수 없습니다.")
+
         print(f"🔎 [Graph-Enhanced] Searching for: {question}")
 
         # === Part 1: 벡터 검색 (공통 로직) ===
@@ -546,8 +630,12 @@ class KoreanDocAgent:
             augmented_results,
             model_key=model_key,
             system_prompt=_GRAPH_RAG_SYSTEM_PROMPT,
+            search_queries=search_queries,
+            graph_context_used=bool(graph_context),
         )
 
+        if return_artifacts:
+            return artifacts
         if return_context:
             return artifacts.answer, artifacts.contexts
         return artifacts.answer

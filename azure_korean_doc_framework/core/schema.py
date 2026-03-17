@@ -32,3 +32,4 @@ class AnswerArtifacts:
     steps: List[PipelineStep] = field(default_factory=list)
     search_results: List[SearchResult] = field(default_factory=list)
     gate_reason: Optional[str] = None
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
