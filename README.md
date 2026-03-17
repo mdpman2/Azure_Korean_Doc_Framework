@@ -8,6 +8,7 @@
 > - `v4.1`: Contextual Retrieval + Hybrid Search
 > - `v4.2`: Guardrails + Evidence Extraction + Quality Evaluation
 > - `v4.3`: 외부 Azure AI Search 인덱스 재사용, 출처 복원, 라이브 재색인 검증
+> - `v4.4`: Agent diagnostics + Query Rewrite feature toggle
 
 ## 🆕 최근 주요 업데이트
 
@@ -16,6 +17,7 @@
 | **v4.1** | Contextual Retrieval, Contextual BM25, Contextual Embeddings, Hybrid Search | 검색 실패율 감소, 원본 텍스트 기반 답변 |
 | **v4.2** | Retrieval Gate, Question Classification, Evidence Extraction, Numeric Verification, PII/Injection/Faithfulness/Hallucination Guardrails, Batch Evaluation | 저품질 검색 차단, 규정형 답변 안정화, 운영 안전장치 강화 |
 | **v4.3** | Azure AI Search 필드 매핑, semantic config 매핑, evidence 답변 출처 복원, 기존 인덱스 재사용, 라이브 재색인 검증 | 외부 인덱스 호환성 확보, 실제 운영 인덱스에 안전하게 연결 |
+| **v4.4** | AnswerArtifacts diagnostics, Query Rewrite 토글, mode-aware validation, 문서 키 안정화 | 운영 디버깅 단순화, 실행 모드 제약 완화, 동일 파일명 충돌 방지 |
 
 ## 🌟 핵심 기능
 
@@ -230,13 +232,16 @@ AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 OPEN_AI_KEY_5=your_openai_api_key
 OPEN_AI_ENDPOINT_5=https://your-resource.openai.azure.com/
 
-# API 버전 (기본값: 2024-12-01-preview)
+# API 버전 (아래 3개 이름 모두 지원, 기본값: 2024-12-01-preview)
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
+# AZURE_OPENAI_API_VER=2024-12-01-preview
+# OPENAI_API_VER=2024-12-01-preview
 
 # -----------------------------------------------------------
 # 모델 배포명 (선택 — 미설정 시 기본값 사용)
 # -----------------------------------------------------------
 # GPT-5.x 는 model-router 를 통해 자동 라우팅됩니다.
+AZURE_OPENAI_DEPLOYMENT_NAME=model-router
 MODEL_DEPLOYMENT_GPT5_4=model-router
 MODEL_DEPLOYMENT_GPT5_2=model-router
 MODEL_DEPLOYMENT_GPT5_1=model-router
@@ -301,6 +306,7 @@ AZURE_SEARCH_SEMANTIC_CONFIG=my-semantic-config
 
 # 주의: config.py는 load_dotenv(override=True)를 사용하므로,
 # 워크스페이스 루트 .env 값이 프로젝트 하위 .env 값을 덮어쓸 수 있습니다.
+# 현재 config.py는 AZURE_OPENAI_* 와 OPEN_AI_* 별칭을 함께 읽습니다.
 
 # -----------------------------------------------------------
 # [v4.0] Graph RAG 설정 (선택 — 기본값 제공)
@@ -318,6 +324,8 @@ CONTEXTUAL_RETRIEVAL_ENABLED=true
 CONTEXTUAL_RETRIEVAL_MODEL=gpt-5.4
 CONTEXTUAL_RETRIEVAL_MAX_TOKENS=150
 CONTEXTUAL_RETRIEVAL_BATCH_SIZE=5
+QUERY_REWRITE_ENABLED=true
+ANSWER_DIAGNOSTICS_ENABLED=true
 
 # -----------------------------------------------------------
 # [v4.2] Retrieval / Guardrails / Evaluation 설정
@@ -362,6 +370,8 @@ python doc_chunk_main.py --path "data/sample.pdf" --workers 5
 python doc_chunk_main.py --path "data/sample.pdf" --skip-qa
 ```
 
+동일한 파일명이 여러 폴더에 있어도 이제는 워크스페이스 기준 상대 경로를 문서 키로 사용하므로 인덱스 충돌 없이 함께 적재됩니다.
+
 ### 2. Graph RAG 활용 (v4.0 신규)
 
 ```bash
@@ -402,6 +412,25 @@ python doc_chunk_main.py --skip-ingest --question "올해의 경제 전망은?"
 # 특정 모델로 테스트
 python doc_chunk_main.py --skip-ingest --question "늘봄학교란?" --model "gpt-5.4"
 ```
+
+### 4-1. 운영 진단 정보 확인 (v4.4)
+
+```python
+from azure_korean_doc_framework.core.agent import KoreanDocAgent
+
+agent = KoreanDocAgent()
+artifacts = agent.answer_question(
+  "늘봄학교란?",
+  return_artifacts=True,
+)
+
+print(artifacts.answer)
+print(artifacts.diagnostics)
+```
+
+`artifacts.diagnostics`에는 query variant 수, 상위 검색 점수, 상위 출처, graph context 사용 여부 등이 포함됩니다.
+
+주의: `return_artifacts=True` 와 `return_context=True` 는 동시에 사용할 수 없습니다. 두 옵션을 함께 넘기면 `ValueError`가 발생합니다.
 
 ### 5. 출력 예시
 
@@ -491,8 +520,8 @@ azure_korean_doc_framework1/
 | `_RAG_SYSTEM_PROMPT` | 모듈 상수 — 기본 RAG 시스템 프롬프트 (DRY 원칙) |
 | `_GRAPH_RAG_SYSTEM_PROMPT` | 모듈 상수 — Graph RAG용 확장 시스템 프롬프트 |
 | `_vector_search()` | **[v4.1]** Hybrid Search: BM25 + Vector + Semantic Ranking (Contextual Retrieval) |
-| `answer_question()` | 기본 RAG 질의응답 (Hybrid Search + 원본 텍스트 기반 답변 + 출처 표기) |
-| `graph_enhanced_answer()` | **[v4.0]** Graph-Enhanced RAG (벡터 + KG 결합) |
+| `answer_question()` | 기본 RAG 질의응답. `return_artifacts=True` 시 diagnostics 포함 산출물 반환 |
+| `graph_enhanced_answer()` | **[v4.0]** Graph-Enhanced RAG (벡터 + KG 결합). `return_artifacts=True` 지원 |
 | `_rewrite_query()` | Query Rewrite - 의미적 쿼리 확장 |
 
 ### v4.2 운영 안전장치

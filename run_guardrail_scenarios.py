@@ -70,6 +70,8 @@ def print_scenario(title: str, artifacts):
     print(f"답변: {artifacts.answer}")
     if artifacts.gate_reason:
         print(f"게이트 사유: {artifacts.gate_reason}")
+    if artifacts.diagnostics:
+        print(f"진단 정보: {artifacts.diagnostics}")
     print("파이프라인 단계:")
     for step in artifacts.steps:
         status = "PASS" if step.passed else "FAIL"

@@ -44,6 +44,20 @@ try:
 except ImportError:
     HAS_ENTITY_EXTRACTOR = False
 
+
+SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_ROOT = os.path.dirname(SCRIPT_ROOT)
+
+
+def _build_document_key(file_path: str) -> str:
+    """동일 파일명 충돌을 피하기 위해 워크스페이스 기준 상대 경로를 문서 키로 사용합니다."""
+    absolute_path = os.path.abspath(file_path)
+    try:
+        relative_path = os.path.relpath(absolute_path, start=WORKSPACE_ROOT)
+    except ValueError:
+        relative_path = absolute_path
+    return relative_path.replace("\\", "/")
+
 def calculate_file_hash(file_path: str) -> str:
     """파일의 SHA256 해시를 계산하여 내용 변경 여부를 정확히 판단합니다."""
     sha256_hash = hashlib.sha256()
@@ -54,6 +68,7 @@ def calculate_file_hash(file_path: str) -> str:
 
 def process_single_file(
     file_path: str,
+    document_key: str,
     parser: HybridDocumentParser,
     chunker: KoreanSemanticChunker,
     vector_store: VectorStore
@@ -68,17 +83,18 @@ def process_single_file(
         file_mod_time = os.path.getmtime(file_path)
         file_hash = calculate_file_hash(file_path)
 
-        if vector_store.is_file_up_to_date(filename, file_mod_time, file_hash=file_hash):
+        if vector_store.is_file_up_to_date(document_key, file_mod_time, file_hash=file_hash):
              return f"⏩ [SKIPPED] {filename} (최신 상태)"
 
         # 2. 파싱 및 청킹
-        print(f"🔄 [START] {filename}: 파일 변경 감지. 처리를 시작합니다...")
-        vector_store.delete_documents_by_parent_id(filename)
+        print(f"🔄 [START] {filename}: 파일 변경 감지. 처리를 시작합니다... (key={document_key})")
+        vector_store.delete_documents_by_parent_id(document_key)
 
         parsed_segments = parser.parse(file_path)
 
         extra_meta = {
-            "source": filename,
+            "source": document_key,
+            "source_name": filename,
             "last_modified": file_mod_time,
             "content_hash": file_hash
         }
@@ -127,7 +143,17 @@ def process_documents(
     # ThreadPoolExecutor를 사용한 병렬 처리
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_file = {executor.submit(process_single_file, f, parser, chunker, vector_store): f for f in files_to_process}
+        future_to_file = {
+            executor.submit(
+                process_single_file,
+                f,
+                _build_document_key(f),
+                parser,
+                chunker,
+                vector_store,
+            ): f
+            for f in files_to_process
+        }
         for future in as_completed(future_to_file):
             res = future.result()
             print(f"   > {res}")
@@ -231,20 +257,33 @@ def main():
 
     args = arg_parser.parse_args()
 
-    # 0. 환경 변수 체크
+    will_ingest = not args.skip_ingest
+    will_run_qa = not args.skip_qa
+    will_extract_entities = args.extract_entities and HAS_ENTITY_EXTRACTOR
+    will_build_graph = args.graph_rag and HAS_GRAPH_RAG and will_ingest
+
+    # 0. 실행 모드별 환경 변수 체크
     try:
-        Config.validate()
+        Config.validate(
+            require_openai=will_ingest or will_run_qa or will_extract_entities or will_build_graph,
+            require_search=will_ingest or will_run_qa,
+            require_di=will_ingest,
+        )
     except Exception as e:
         print(e)
         return
 
     # 1. 구성 요소 초기화
-    doc_parser = HybridDocumentParser()
-    chunker = KoreanSemanticChunker()
-    vector_store = VectorStore()
+    doc_parser = None
+    chunker = None
+    vector_store = None
+    if will_ingest:
+        doc_parser = HybridDocumentParser()
+        chunker = KoreanSemanticChunker()
+        vector_store = VectorStore()
 
     # 2. 문서 수집 (Ingestion)
-    if not args.skip_ingest:
+    if will_ingest:
         # 경로가 지정되지 않은 경우 기본 경로 사용
         target_paths = args.path if args.path else [r"RAG_TEST_DATA"]
 
@@ -273,7 +312,7 @@ def main():
             print(f"📁 기존 Knowledge Graph 로드 완료")
 
         # 새로운 청크가 있으면 그래프 구축
-        if not args.skip_ingest:
+        if will_ingest:
             chunk_files = glob.glob("output/*_chunks.json")
             if chunk_files:
                 all_chunk_texts = []
@@ -325,7 +364,7 @@ def main():
             print(f"   ✅ {os.path.basename(cf)}: {len(result.extractions)}개 엔티티 추출 → {output_path}")
 
     # 3. Q&A 테스트
-    if not args.skip_qa:
+    if will_run_qa:
         models_to_test = [args.model]
 
         # v4.0: Graph RAG가 활성화되면 graph_enhanced_answer 사용
