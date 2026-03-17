@@ -1,11 +1,10 @@
-"""
-Azure 서비스 클라이언트 팩토리 모듈
+"""Azure 서비스 클라이언트 팩토리 모듈.
 
-Azure OpenAI, Document Intelligence, AI Search 클라이언트를
-생성하고 캐싱하여 불필요한 인스턴스 재생성을 방지합니다.
+공용 Azure SDK 클라이언트를 지연 생성하고 캐싱합니다.
+Azure OpenAI는 동기/비동기 클라이언트를 분리 캐싱해 반복 생성 비용을 줄입니다.
 """
 
-from openai import AzureOpenAI
+from openai import AsyncAzureOpenAI, AzureOpenAI
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
@@ -14,7 +13,8 @@ from ..config import Config
 
 class AzureClientFactory:
     """
-    Azure 서비스 클라이언트 생성을 담당하는 팩토리 클래스
+    Azure 서비스 클라이언트 생성을 담당하는 팩토리 클래스.
+
     클라이언트 캐싱을 통해 불필요한 인스턴스 생성을 방지하고 성능을 최적화합니다.
     """
     _cache = {}
@@ -27,31 +27,35 @@ class AzureClientFactory:
         return cls._cache[key]
 
     @staticmethod
+    def _build_openai_client(async_client: bool, is_advanced: bool):
+        api_key, endpoint, api_version = Config.get_openai_credentials(prefer_advanced=is_advanced)
+        if not api_key or not endpoint:
+            raise ValueError("Azure OpenAI API 키 또는 엔드포인트가 설정되지 않았습니다.")
+
+        client_class = AsyncAzureOpenAI if async_client else AzureOpenAI
+        return client_class(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=endpoint,
+        )
+
+    @staticmethod
     def get_openai_client(is_advanced=False):
-        """
-        Azure OpenAI 클라이언트를 반환합니다.
+        """동기 Azure OpenAI 클라이언트를 반환합니다."""
+        cache_key = f"openai_sync_{'advanced' if is_advanced else 'standard'}"
+        return AzureClientFactory._get_from_cache(
+            cache_key,
+            lambda: AzureClientFactory._build_openai_client(async_client=False, is_advanced=is_advanced),
+        )
 
-        NOTE: 현재 환경에서는 OPENAI_API_KEY_5/ENDPOINT_5가 기본 엔드포인트와 동일하므로
-              모든 요청에 고성능 엔드포인트를 사용합니다.
-        """
-        # 단일 클라이언트로 통합 (캐시 키 고정)
-        cache_key = "openai_unified"
-
-        def create_client():
-            # 고성능 엔드포인트 우선, 없으면 기본 엔드포인트 사용
-            api_key = Config.OPENAI_API_KEY_5 or Config.OPENAI_API_KEY
-            endpoint = Config.OPENAI_ENDPOINT_5 or Config.OPENAI_ENDPOINT
-
-            if not api_key or not endpoint:
-                raise ValueError("Azure OpenAI API 키 또는 엔드포인트가 설정되지 않았습니다.")
-
-            return AzureOpenAI(
-                api_key=api_key,
-                api_version=Config.OPENAI_API_VERSION,
-                azure_endpoint=endpoint
-            )
-
-        return AzureClientFactory._get_from_cache(cache_key, create_client)
+    @staticmethod
+    def get_async_openai_client(is_advanced=False):
+        """비동기 Azure OpenAI 클라이언트를 반환합니다."""
+        cache_key = f"openai_async_{'advanced' if is_advanced else 'standard'}"
+        return AzureClientFactory._get_from_cache(
+            cache_key,
+            lambda: AzureClientFactory._build_openai_client(async_client=True, is_advanced=is_advanced),
+        )
 
     @staticmethod
     def get_di_client():
