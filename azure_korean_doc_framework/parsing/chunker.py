@@ -204,6 +204,12 @@ class AdaptiveChunker:
             # v4.0: 한국어 텍스트 비율 메타데이터
             "hangul_ratio": self._calculate_hangul_ratio(chunk_text),
         })
+        if "type" in enriched and "chunk_type" not in enriched:
+            enriched["chunk_type"] = enriched["type"]
+        if "page" in enriched and "page_number" not in enriched:
+            enriched["page_number"] = enriched["page"]
+        if "source" in enriched and "source_file" not in enriched:
+            enriched["source_file"] = enriched["source"]
         return enriched
 
     def _calculate_hangul_ratio(self, text: str) -> float:
@@ -213,6 +219,61 @@ class AdaptiveChunker:
         hangul_count = len(_HANGUL_SYLLABLE_RE.findall(text))
         total_chars = len(text.replace(' ', '').replace('\n', ''))
         return round(hangul_count / max(total_chars, 1), 3)
+
+    def _collect_source_regions(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """세그먼트에 포함된 source_regions를 병합하고 중복 제거합니다."""
+        merged_regions = []
+        seen = set()
+
+        for segment in segments:
+            regions = segment.get("source_regions") or []
+            if not regions and (segment.get("bounding_box") or segment.get("polygon")):
+                regions = [{
+                    "page_number": segment.get("page"),
+                    "bounding_box": segment.get("bounding_box"),
+                    "polygon": segment.get("polygon"),
+                    "unit": segment.get("page_unit"),
+                }]
+
+            for region in regions:
+                polygon = region.get("polygon") or []
+                polygon_key = tuple((point.get("x"), point.get("y")) for point in polygon)
+                key = (region.get("page_number"), polygon_key)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_regions.append(region)
+
+        merged_regions.sort(key=lambda item: (item.get("page_number") or 0, (item.get("bounding_box") or {}).get("top", 0)))
+        return merged_regions
+
+    def _apply_layout_metadata(
+        self,
+        metadata: Dict[str, Any],
+        segments: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """세그먼트의 레이아웃 메타데이터를 청크 메타데이터로 전파합니다."""
+        enriched = metadata.copy()
+        source_regions = self._collect_source_regions(segments)
+        if not source_regions:
+            return enriched
+
+        enriched["source_regions"] = source_regions
+
+        page_numbers = sorted({region.get("page_number") for region in source_regions if region.get("page_number") is not None})
+        if page_numbers:
+            enriched.setdefault("page", page_numbers[0])
+            enriched["page_numbers"] = page_numbers
+
+        primary_region = source_regions[0]
+        if primary_region.get("bounding_box") is not None:
+            enriched["bounding_box"] = primary_region["bounding_box"]
+        if primary_region.get("polygon"):
+            enriched["polygon"] = primary_region["polygon"]
+        if primary_region.get("unit") is not None:
+            enriched["page_unit"] = primary_region["unit"]
+
+        return enriched
 
     # ==================== 표/이미지 청크 분리 ====================
 
@@ -243,6 +304,7 @@ class AdaptiveChunker:
                     "page": seg.get("page", 1),
                     "searchable": True  # 검색 최적화 플래그
                 })
+                meta = self._apply_layout_metadata(meta, [seg])
                 special_chunks.append(Document(page_content=content, metadata=meta))
 
             elif seg_type == "image":
@@ -254,6 +316,7 @@ class AdaptiveChunker:
                     "page": seg.get("page", 1),
                     "searchable": True
                 })
+                meta = self._apply_layout_metadata(meta, [seg])
                 special_chunks.append(Document(page_content=content, metadata=meta))
 
         return special_chunks
@@ -554,11 +617,15 @@ class AdaptiveChunker:
                         meta = extra_metadata.copy()
                         meta['is_table_data'] = True
                         meta["page"] = seg.get("page", 1)
+                        meta["type"] = "table"
+                        meta = self._apply_layout_metadata(meta, [seg])
                         final_chunks.append(Document(page_content=sub_chunk, metadata=meta))
                 else:
                     meta = extra_metadata.copy()
                     meta['is_table_data'] = True
                     meta["page"] = seg.get("page", 1)
+                    meta["type"] = "table"
+                    meta = self._apply_layout_metadata(meta, [seg])
                     final_chunks.append(Document(page_content=serialized_text, metadata=meta))
 
             else:
@@ -568,7 +635,10 @@ class AdaptiveChunker:
                     sub_chunks = self._split_with_overlap(text_content)
                     for sub_chunk in sub_chunks:
                         if self._count_tokens(sub_chunk) >= self.config.min_tokens:
-                            final_chunks.append(Document(page_content=sub_chunk, metadata=extra_metadata.copy()))
+                            meta = extra_metadata.copy()
+                            meta["type"] = seg.get("type", "text")
+                            meta = self._apply_layout_metadata(meta, [seg])
+                            final_chunks.append(Document(page_content=sub_chunk, metadata=meta))
 
         return final_chunks
 
@@ -602,14 +672,15 @@ class AdaptiveChunker:
         print("   🌲 Strategy: HIERARCHICAL (Context-Rich + Overlap)")
         final_chunks = []
         header_stack = []  # [(level, text), ...]
-        text_buffer = []
+        text_buffer: List[Dict[str, Any]] = []
 
         def get_breadcrumb():
             return " > ".join([h[1] for h in header_stack])
 
         def flush_text_buffer():
             if not text_buffer: return
-            combined_text = "\n\n".join(text_buffer)
+            buffered_segments = text_buffer.copy()
+            combined_text = "\n\n".join(seg["content"] for seg in buffered_segments)
             text_buffer.clear()
 
             current_breadcrumb = get_breadcrumb()
@@ -627,6 +698,7 @@ class AdaptiveChunker:
                 base_meta = extra_metadata.copy()
                 base_meta["breadcrumb"] = current_breadcrumb
                 base_meta["type"] = "text"
+                base_meta = self._apply_layout_metadata(base_meta, buffered_segments)
 
                 content = f"[{current_breadcrumb}]\n{sub_chunk}" if current_breadcrumb else sub_chunk
                 final_chunks.append(Document(page_content=content, metadata=base_meta))
@@ -663,11 +735,12 @@ class AdaptiveChunker:
                 meta["breadcrumb"] = current_breadcrumb
                 meta["type"] = "table"
                 meta["page"] = seg.get("page", 1)
+                meta = self._apply_layout_metadata(meta, [seg])
                 final_chunks.append(Document(page_content=full_content, metadata=meta))
 
             elif seg_type in ["text", "image"]:
                 if content.strip():
-                    text_buffer.append(content)
+                    text_buffer.append(seg)
 
         flush_text_buffer()
         return final_chunks
@@ -687,7 +760,10 @@ class AdaptiveChunker:
         final_chunks = []
         for sub_chunk in sub_chunks:
             if self._count_tokens(sub_chunk) >= self.config.min_tokens:
-                final_chunks.append(Document(page_content=sub_chunk, metadata=extra_metadata.copy()))
+                meta = extra_metadata.copy()
+                meta["type"] = "text"
+                meta = self._apply_layout_metadata(meta, segments)
+                final_chunks.append(Document(page_content=sub_chunk, metadata=meta))
 
         return final_chunks
 

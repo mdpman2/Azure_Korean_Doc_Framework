@@ -179,6 +179,9 @@ class KoreanDocAgent:
             Config.SEARCH_ORIGINAL_CONTENT_FIELD,
             Config.SEARCH_TITLE_FIELD,
             Config.SEARCH_SOURCE_FIELD,
+            Config.SEARCH_CITATION_FIELD,
+            Config.SEARCH_BOUNDING_BOX_FIELD,
+            Config.SEARCH_SOURCE_REGIONS_FIELD,
         ]))
 
         deduplicated_results = {}
@@ -219,7 +222,12 @@ class KoreanDocAgent:
                         content=content,
                         source=source,
                         score=score,
-                        metadata={"raw_chunk": r.get(Config.SEARCH_CONTENT_FIELD, '')},
+                        metadata={
+                            "raw_chunk": r.get(Config.SEARCH_CONTENT_FIELD, ''),
+                            "citation": r.get(Config.SEARCH_CITATION_FIELD, ''),
+                            "bounding_box": self._loads_json_value(r.get(Config.SEARCH_BOUNDING_BOX_FIELD)),
+                            "source_regions": self._loads_json_value(r.get(Config.SEARCH_SOURCE_REGIONS_FIELD)),
+                        },
                     )
 
                     existing = deduplicated_results.get(content_key)
@@ -245,6 +253,61 @@ class KoreanDocAgent:
                 except (TypeError, ValueError):
                     continue
         return 0.0
+
+    def _loads_json_value(self, value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _build_exact_citation_label(self, result: SearchResult) -> str:
+        citation = result.metadata.get("citation")
+        if citation:
+            return f"[출처: {citation}]"
+        return f"[출처: {result.source}]"
+
+    def _append_exact_citations(
+        self,
+        answer: str,
+        search_results: List[SearchResult],
+        preferred_sources: Optional[List[str]] = None,
+    ) -> str:
+        if not Config.EXACT_CITATION_ENABLED or not search_results:
+            return answer
+
+        preferred = set(preferred_sources or [])
+        citation_labels = []
+        seen = set()
+        for result in search_results:
+            if preferred and result.source not in preferred:
+                continue
+            label = self._build_exact_citation_label(result)
+            if label in answer:
+                continue
+            if label in seen:
+                continue
+            seen.add(label)
+            citation_labels.append(label)
+
+        if not citation_labels and preferred:
+            for result in search_results:
+                label = self._build_exact_citation_label(result)
+                if label in seen:
+                    continue
+                seen.add(label)
+                citation_labels.append(label)
+
+        if not citation_labels:
+            return answer
+
+        citation_block = "\n".join(citation_labels)
+        if citation_block in answer:
+            return answer
+        return f"{answer}\n\n{citation_block}" if answer else citation_block
 
     def _format_contexts(self, results: List[SearchResult]) -> List[str]:
         return [f"[출처: {item.source}]\n{item.content}" for item in results]
@@ -395,8 +458,7 @@ class KoreanDocAgent:
 
         if evidence_used is not None:
             answer = evidence_used.answer
-            if evidence_used.sources and "[출처:" not in answer:
-                answer = f"{answer}\n\n[출처: {', '.join(evidence_used.sources)}]"
+            answer = self._append_exact_citations(answer, search_results, preferred_sources=evidence_used.sources)
             steps.append(PipelineStep(
                 name="evidence_extraction",
                 passed=True,
@@ -450,6 +512,8 @@ class KoreanDocAgent:
                     "ungrounded_claims": hallucination.ungrounded_claims,
                 },
             ))
+
+        answer = self._append_exact_citations(answer, search_results)
 
         return self._finalize_artifacts(
             question=question,

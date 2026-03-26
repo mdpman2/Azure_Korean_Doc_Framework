@@ -16,6 +16,7 @@ class Config:
 
     [2026-03 v4.3]
     - GPT-5.4 기본 모델로 통일
+    - `AZURE_OPENAI_*` 와 `OPEN_AI_*` 별칭을 함께 지원
     - 고성능 endpoint/key는 기본 endpoint/key와 동일 값 사용 가능
 
     [2026-02 v4.0]
@@ -32,15 +33,20 @@ class Config:
     # =================================================================
 
     # 기본 엔드포인트 (GPT-5.4 지원)
-    OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-    OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+    OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPEN_AI_KEY_5")
+    OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("OPEN_AI_ENDPOINT_5")
 
-    # API 버전 (환경 변수 우선, 기본값: 2024-12-01-preview)
-    OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+    # API 버전 (환경 변수 별칭 우선, 기본값: 2024-12-01-preview)
+    OPENAI_API_VERSION = (
+        os.getenv("AZURE_OPENAI_API_VERSION")
+        or os.getenv("AZURE_OPENAI_API_VER")
+        or os.getenv("OPENAI_API_VER")
+        or "2024-12-01-preview"
+    )
 
     # 고성능 모델 전용 엔드포인트 (기본 endpoint/key와 동일 값 사용 가능)
-    OPENAI_API_KEY_5 = os.getenv("OPEN_AI_KEY_5")
-    OPENAI_ENDPOINT_5 = os.getenv("OPEN_AI_ENDPOINT_5")
+    OPENAI_API_KEY_5 = os.getenv("OPEN_AI_KEY_5") or OPENAI_API_KEY
+    OPENAI_ENDPOINT_5 = os.getenv("OPEN_AI_ENDPOINT_5") or OPENAI_ENDPOINT
 
     # =================================================================
     # 모델 배포 설정 (2026년 최신 모델)
@@ -126,6 +132,9 @@ class Config:
     SEARCH_PARENT_FIELD = os.getenv("AZURE_SEARCH_PARENT_FIELD", "parent_id")
     # 사용자에게 보여줄 출처 라벨. 외부 인덱스에서는 title 같은 사람이 읽기 쉬운 필드를 권장합니다.
     SEARCH_SOURCE_FIELD = os.getenv("AZURE_SEARCH_SOURCE_FIELD", "parent_id")
+    SEARCH_CITATION_FIELD = os.getenv("AZURE_SEARCH_CITATION_FIELD", "citation")
+    SEARCH_BOUNDING_BOX_FIELD = os.getenv("AZURE_SEARCH_BOUNDING_BOX_FIELD", "bounding_box_json")
+    SEARCH_SOURCE_REGIONS_FIELD = os.getenv("AZURE_SEARCH_SOURCE_REGIONS_FIELD", "source_regions_json")
     SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG", "my-semantic-config")
 
     # =================================================================
@@ -165,6 +174,12 @@ class Config:
     # 맥락 생성 배치 크기 (동시 처리할 청크 수)
     CONTEXTUAL_RETRIEVAL_BATCH_SIZE = int(os.getenv("CONTEXTUAL_RETRIEVAL_BATCH_SIZE", "5"))
 
+    # Agent 질의 확장(Query Rewrite) 기본 활성화 여부
+    QUERY_REWRITE_ENABLED = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() == "true"
+
+    # 답변 산출물에 운영 진단 정보 포함 여부
+    ANSWER_DIAGNOSTICS_ENABLED = os.getenv("ANSWER_DIAGNOSTICS_ENABLED", "true").lower() == "true"
+
     # =================================================================
     # 구조화 추출 설정 (v4.0 신규 - LangExtract 기반)
     # =================================================================
@@ -203,16 +218,49 @@ class Config:
     EVALUATION_JUDGE_MODEL = os.getenv("EVALUATION_JUDGE_MODEL", "gpt-5.4")
 
     @classmethod
-    def validate(cls):
-        """필수 환경 변수가 설정되어 있는지 확인합니다."""
+    def get_openai_credentials(cls, prefer_advanced: bool = True):
+        """환경 변수 별칭을 흡수한 OpenAI 인증 정보와 API 버전을 반환"""
+        api_key = cls.OPENAI_API_KEY_5 if prefer_advanced else cls.OPENAI_API_KEY
+        endpoint = cls.OPENAI_ENDPOINT_5 if prefer_advanced else cls.OPENAI_ENDPOINT
+        api_key = api_key or cls.OPENAI_API_KEY or cls.OPENAI_API_KEY_5
+        endpoint = endpoint or cls.OPENAI_ENDPOINT or cls.OPENAI_ENDPOINT_5
+        return api_key, endpoint, cls.OPENAI_API_VERSION
+
+    @classmethod
+    def get_model_deployment(cls, model_name: str) -> str:
+        """모델명에 대응하는 실제 deployment 이름 반환"""
+        return cls.MODELS.get(model_name, model_name)
+
+    @classmethod
+    def validate(
+        cls,
+        *,
+        require_openai: bool = True,
+        require_search: bool = True,
+        require_di: bool = True,
+    ):
+        """실행 모드에 맞는 필수 환경 변수가 설정되어 있는지 확인합니다."""
         missing = []
-        if not cls.OPENAI_API_KEY: missing.append("AZURE_OPENAI_API_KEY")
-        if not cls.OPENAI_ENDPOINT: missing.append("AZURE_OPENAI_ENDPOINT")
-        if not cls.DI_KEY: missing.append("AZURE_DI_KEY")
-        if not cls.DI_ENDPOINT: missing.append("AZURE_DI_ENDPOINT")
-        if not cls.SEARCH_KEY: missing.append("AZURE_SEARCH_KEY")
-        if not cls.SEARCH_ENDPOINT: missing.append("AZURE_SEARCH_ENDPOINT")
-        if not cls.SEARCH_INDEX_NAME: missing.append("AZURE_SEARCH_INDEX_NAME")
+        if require_openai:
+            api_key, endpoint, _ = cls.get_openai_credentials(prefer_advanced=True)
+            if not api_key:
+                missing.append("AZURE_OPENAI_API_KEY 또는 OPEN_AI_KEY_5")
+            if not endpoint:
+                missing.append("AZURE_OPENAI_ENDPOINT 또는 OPEN_AI_ENDPOINT_5")
+
+        if require_di:
+            if not cls.DI_KEY:
+                missing.append("AZURE_DI_KEY")
+            if not cls.DI_ENDPOINT:
+                missing.append("AZURE_DI_ENDPOINT")
+
+        if require_search:
+            if not cls.SEARCH_KEY:
+                missing.append("AZURE_SEARCH_KEY")
+            if not cls.SEARCH_ENDPOINT:
+                missing.append("AZURE_SEARCH_ENDPOINT")
+            if not cls.SEARCH_INDEX_NAME:
+                missing.append("AZURE_SEARCH_INDEX_NAME")
 
         if missing:
             error_msg = "\n".join([f"❌ 환경 변수 누락: {var}" for var in missing])

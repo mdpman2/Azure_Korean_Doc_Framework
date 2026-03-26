@@ -1,4 +1,5 @@
 import hashlib
+import json
 from typing import List, Dict, Any, Optional
 from azure.search.documents.indexes.models import (
     SearchIndex,
@@ -70,6 +71,9 @@ class VectorStore:
             SimpleField(name=Config.SEARCH_PARENT_FIELD, type=SearchFieldDataType.String, filterable=True, facetable=True),
             SimpleField(name="last_modified", type=SearchFieldDataType.String, filterable=True),
             SimpleField(name="content_hash", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name=Config.SEARCH_CITATION_FIELD, type=SearchFieldDataType.String),
+            SimpleField(name=Config.SEARCH_BOUNDING_BOX_FIELD, type=SearchFieldDataType.String),
+            SimpleField(name=Config.SEARCH_SOURCE_REGIONS_FIELD, type=SearchFieldDataType.String),
             SearchField(name=Config.SEARCH_CONTENT_FIELD, type=SearchFieldDataType.String, searchable=True, analyzer_name="ko.microsoft"),
             SearchField(name=Config.SEARCH_ORIGINAL_CONTENT_FIELD, type=SearchFieldDataType.String, searchable=True),
             SearchField(name=Config.SEARCH_TITLE_FIELD, type=SearchFieldDataType.String, searchable=True),
@@ -86,6 +90,39 @@ class VectorStore:
     def _batched(items: List[Any], batch_size: int):
         for start in range(0, len(items), batch_size):
             yield items[start:start + batch_size]
+
+    @staticmethod
+    def _json_dumps(value: Any) -> str:
+        if value in (None, "", [], {}):
+            return ""
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _build_citation_value(chunk: Document, fallback_source: str) -> str:
+        page_numbers = chunk.metadata.get("page_numbers") or []
+        if not page_numbers and chunk.metadata.get("page_number") is not None:
+            page_numbers = [chunk.metadata.get("page_number")]
+
+        page_part = ""
+        if page_numbers:
+            if len(page_numbers) == 1:
+                page_part = f"p.{page_numbers[0]}"
+            else:
+                page_part = "pp." + ",".join(str(page) for page in page_numbers)
+
+        bbox = chunk.metadata.get("bounding_box") or {}
+        bbox_part = ""
+        if bbox:
+            bbox_part = (
+                "bbox: "
+                f"{bbox.get('left', 0):.2f},"
+                f"{bbox.get('top', 0):.2f},"
+                f"{bbox.get('right', 0):.2f},"
+                f"{bbox.get('bottom', 0):.2f}"
+            )
+
+        suffix = " | ".join(part for part in [page_part, bbox_part] if part)
+        return f"{fallback_source} | {suffix}" if suffix else fallback_source
 
     def create_index_if_not_exists(self, vector_dim: int = 1536) -> None:
         """
@@ -152,6 +189,21 @@ class VectorStore:
             if "content_hash" not in field_names:
                 print(f"🛠️ 'content_hash' 필드 추가 중: {self.index_name}")
                 index.fields.append(SimpleField(name="content_hash", type=SearchFieldDataType.String, filterable=True))
+                updated = True
+
+            if Config.SEARCH_CITATION_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_CITATION_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(SimpleField(name=Config.SEARCH_CITATION_FIELD, type=SearchFieldDataType.String))
+                updated = True
+
+            if Config.SEARCH_BOUNDING_BOX_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_BOUNDING_BOX_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(SimpleField(name=Config.SEARCH_BOUNDING_BOX_FIELD, type=SearchFieldDataType.String))
+                updated = True
+
+            if Config.SEARCH_SOURCE_REGIONS_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_SOURCE_REGIONS_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(SimpleField(name=Config.SEARCH_SOURCE_REGIONS_FIELD, type=SearchFieldDataType.String))
                 updated = True
 
             # v4.1: 원본 텍스트 보존 필드 동적 추가
@@ -222,6 +274,9 @@ class VectorStore:
                 Config.SEARCH_PARENT_FIELD: parent_id_str,
                 "last_modified": str(chunk.metadata.get("last_modified", "")),
                 "content_hash": str(chunk.metadata.get("content_hash", "")),
+                Config.SEARCH_CITATION_FIELD: self._build_citation_value(chunk, title),
+                Config.SEARCH_BOUNDING_BOX_FIELD: self._json_dumps(chunk.metadata.get("bounding_box")),
+                Config.SEARCH_SOURCE_REGIONS_FIELD: self._json_dumps(chunk.metadata.get("source_regions")),
                 Config.SEARCH_VECTOR_FIELD: vector,
             }
             if Config.SEARCH_SOURCE_FIELD not in document:

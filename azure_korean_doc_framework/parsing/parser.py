@@ -128,6 +128,70 @@ class HybridDocumentParser:
 
         return content, "text" if role is None else role
 
+    def _normalize_polygon(self, polygon: Any) -> List[Dict[str, float]]:
+        """Azure DI polygon을 직렬화 가능한 x/y 포인트 목록으로 정규화합니다."""
+        if not polygon:
+            return []
+
+        points: List[Dict[str, float]] = []
+        if all(hasattr(point, 'x') and hasattr(point, 'y') for point in polygon):
+            for point in polygon:
+                points.append({"x": float(point.x), "y": float(point.y)})
+            return points
+
+        if len(polygon) >= 2 and isinstance(polygon[0], (int, float)):
+            for x_coord, y_coord in zip(polygon[0::2], polygon[1::2]):
+                points.append({"x": float(x_coord), "y": float(y_coord)})
+
+        return points
+
+    def _polygon_to_bounding_box(self, polygon_points: List[Dict[str, float]]) -> Optional[Dict[str, float]]:
+        """정규화된 polygon 포인트를 사각 bounding box로 변환합니다."""
+        if not polygon_points:
+            return None
+
+        x_coords = [point["x"] for point in polygon_points]
+        y_coords = [point["y"] for point in polygon_points]
+        return {
+            "left": min(x_coords),
+            "top": min(y_coords),
+            "right": max(x_coords),
+            "bottom": max(y_coords),
+        }
+
+    def _extract_layout_metadata(
+        self,
+        bounding_regions: Any,
+        page_map: Dict[int, Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """bounding_regions를 청크/세그먼트에서 재사용할 수 있는 메타데이터로 정규화합니다."""
+        source_regions = []
+
+        for region in (bounding_regions or []):
+            polygon = self._normalize_polygon(getattr(region, "polygon", None))
+            page_info = page_map.get(region.page_number, {})
+            source_regions.append({
+                "page_number": region.page_number,
+                "polygon": polygon,
+                "bounding_box": self._polygon_to_bounding_box(polygon),
+                "unit": page_info.get("unit"),
+                "page_width": page_info.get("width"),
+                "page_height": page_info.get("height"),
+            })
+
+        if not source_regions:
+            return {}
+
+        primary_region = source_regions[0]
+        metadata = {
+            "source_regions": source_regions,
+            "bounding_box": primary_region.get("bounding_box"),
+            "polygon": primary_region.get("polygon"),
+        }
+        if primary_region.get("unit") is not None:
+            metadata["page_unit"] = primary_region["unit"]
+        return metadata
+
     def _pdf_to_images(self, file_path: str, dpi: int = 200) -> Optional[List[Image.Image]]:
         """PyMuPDF를 사용하여 PDF 페이지를 이미지로 변환합니다."""
         try:
@@ -170,6 +234,14 @@ class HybridDocumentParser:
                 output_content_format="markdown" # Markdown 포맷 사용
             )
         result = poller.result()
+        page_map = {
+            page.page_number: {
+                "width": getattr(page, "width", None),
+                "height": getattr(page, "height", None),
+                "unit": getattr(page, "unit", None),
+            }
+            for page in (result.pages or [])
+        }
 
         segments = []
 
@@ -181,6 +253,7 @@ class HybridDocumentParser:
             if not table.spans: continue
 
             start_offset = min(span.offset for span in table.spans)
+            layout_metadata = self._extract_layout_metadata(table.bounding_regions, page_map)
 
             # 테이블 컨텐츠 재구성 (Azure가 제공하는 cells 활용)
             table_content = self._table_to_markdown(table)
@@ -189,7 +262,8 @@ class HybridDocumentParser:
                 "type": "table",
                 "content": table_content,
                 "offset": start_offset,
-                "page": table.bounding_regions[0].page_number if table.bounding_regions else 1
+                "page": table.bounding_regions[0].page_number if table.bounding_regions else 1,
+                **layout_metadata,
             })
 
             # 스팬 범위 저장 (이진 탐색 최적화를 위해 start 기준 정렬 후 사용)
@@ -218,12 +292,15 @@ class HybridDocumentParser:
                 seg_type = "header"
                 content = enhanced_content
 
+            layout_metadata = self._extract_layout_metadata(para.bounding_regions, page_map)
+
             segments.append({
                 "type": seg_type,
                 "content": content,
                 "role": role, # 헤더 레벨 추론을 위해 저장
                 "offset": para.spans[0].offset,
-                "page": para.bounding_regions[0].page_number if para.bounding_regions else 1
+                "page": para.bounding_regions[0].page_number if para.bounding_regions else 1,
+                **layout_metadata,
             })
 
         # 5. Figure(이미지/차트) 감지 및 GPT-4o 처리
@@ -235,6 +312,7 @@ class HybridDocumentParser:
 
                 region = figure.bounding_regions[0]
                 page_num = region.page_number - 1
+                layout_metadata = self._extract_layout_metadata(figure.bounding_regions, page_map)
 
                 if page_num >= len(page_images):
                     continue
@@ -243,20 +321,11 @@ class HybridDocumentParser:
                 di_page = result.pages[page_num]
 
                 # 좌표 변환 및 이미징 크롭
-                polygon = region.polygon
-                if not polygon: continue
+                normalized_polygon = self._normalize_polygon(region.polygon)
+                if not normalized_polygon: continue
 
-                x_coords = []
-                y_coords = []
-
-                # polygon 포맷 대응 (객체 리스트 vs 단순 float 리스트)
-                if all(hasattr(p, 'x') and hasattr(p, 'y') for p in polygon):
-                    x_coords = [p.x for p in polygon]
-                    y_coords = [p.y for p in polygon]
-                elif len(polygon) >= 2 and isinstance(polygon[0], (int, float)):
-                    # [x1, y1, x2, y2, ...] 형태인 경우
-                    x_coords = polygon[0::2]
-                    y_coords = polygon[1::2]
+                x_coords = [point["x"] for point in normalized_polygon]
+                y_coords = [point["y"] for point in normalized_polygon]
 
                 if not x_coords or not y_coords:
                     continue
@@ -289,7 +358,8 @@ class HybridDocumentParser:
                         "type": "image",
                         "content": f"> **[이미지/차트 설명 {idx+1}]**\n> {desc_text}",
                         "offset": start_offset,
-                        "page": region.page_number
+                        "page": region.page_number,
+                        **layout_metadata,
                     })
 
                 except Exception as e:
