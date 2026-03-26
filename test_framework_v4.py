@@ -1,23 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-azure_korean_doc_framework v4.4 종합 테스트 스크립트
+azure_korean_doc_framework v4.5 종합 테스트 스크립트
 
 시나리오별 테스트:
- 1. Config v4.4 설정 검증 (Graph RAG + 구조화 추출 + Contextual Retrieval + feature flags)
+ 1. Config 설정 검증 (Graph RAG + 구조화 추출 + Contextual Retrieval + feature flags)
  2. Azure 클라이언트 초기화 및 캐싱
  3. MultiModelManager (GPT-5.4, max_completion_tokens)
- 4. HybridDocumentParser 초기화
- 5. AdaptiveChunker 청킹 + v4.1 메타데이터 (hangul_ratio, graph_rag_eligible, Contextual Retrieval)
+ 4. HybridDocumentParser 초기화 + layout metadata 정규화
+ 5. AdaptiveChunker 청킹 + 메타데이터 전파 (hangul_ratio, graph_rag_eligible, source_regions)
  6. KnowledgeGraphManager (LightRAG 기반) — 오프라인 그래프 조작
  7. KoreanUnicodeTokenizer + CharInterval (한글 위치 매핑)
  8. StructuredEntityExtractor 데이터 모델 검증
  9. KoreanDocAgent 초기화 + Graph-Enhanced + Hybrid Search 구조
 10. ChunkLogger JSON 직렬화
-11. VectorStore 초기화 + original_chunk 필드
-12. CLI 인자 파싱 (doc_chunk_main.py v4.0 옵션)
-13. Agent diagnostics + feature flags (v4.4)
-14. Mode-aware validation + document key stability (v4.4)
+11. VectorStore 초기화 + original_chunk / citation 필드
+12. CLI 인자 파싱 (doc_chunk_main.py 옵션)
+13. Agent diagnostics + exact citation 시나리오
+14. Mode-aware validation + document key stability
+
+현재 기준 회귀 스위트는 총 220개 항목을 검증합니다.
 """
 
 import sys
@@ -98,6 +100,7 @@ T = TestRunner()
 
 
 def _is_external_dependency_error(message: str) -> bool:
+    """네트워크, DNS, 원격 서비스 상태 같은 외부 요인을 스킵 대상으로 분류합니다."""
     if not message:
         return False
 
@@ -269,13 +272,29 @@ def test_parser():
     print("📄 [4/14] HybridDocumentParser 초기화")
     print("=" * 70)
 
+    from types import SimpleNamespace
     from azure_korean_doc_framework.config import Config
+    from azure_korean_doc_framework.parsing.parser import HybridDocumentParser
+
+    parser_stub = HybridDocumentParser.__new__(HybridDocumentParser)
+    normalized_polygon = parser_stub._normalize_polygon([0, 1, 4, 1, 4, 5, 0, 5])
+    T.check("normalize polygon to 4 points", len(normalized_polygon) == 4, str(normalized_polygon))
+
+    bbox = parser_stub._polygon_to_bounding_box(normalized_polygon)
+    T.check("polygon to bounding box", bbox == {"left": 0.0, "top": 1.0, "right": 4.0, "bottom": 5.0}, str(bbox))
+
+    mock_region = SimpleNamespace(page_number=2, polygon=[1, 2, 5, 2, 5, 6, 1, 6])
+    layout_meta = parser_stub._extract_layout_metadata(
+        [mock_region],
+        {2: {"unit": "inch", "width": 8.5, "height": 11.0}},
+    )
+    T.check("layout metadata has source_regions", len(layout_meta.get("source_regions", [])) == 1)
+    T.check("layout metadata keeps page_unit", layout_meta.get("page_unit") == "inch", str(layout_meta))
+
     if not Config.DI_KEY:
         T.skip("Parser 초기화", "AZURE_DI_KEY 미설정 (Document Intelligence 필요)")
         T.skip("has gpt_model attr", "AZURE_DI_KEY 미설정")
         return
-
-    from azure_korean_doc_framework.parsing.parser import HybridDocumentParser
 
     try:
         parser = HybridDocumentParser()
@@ -324,11 +343,61 @@ def test_chunker_v4():
     Config.CONTEXTUAL_RETRIEVAL_ENABLED = False
 
     test_segments = [
-        {"type": "header", "content": "# 1장 서론", "page": 1},
-        {"type": "text", "content": "한국어 문서 분석을 위한 프레임워크입니다. " * 20, "page": 1},
-        {"type": "table", "content": "| 항목 | 값 |\n|---|---|\n| A | 100 |", "page": 2},
-        {"type": "image", "content": "> **[이미지/차트 설명]** 그래프 이미지", "page": 2},
-        {"type": "text", "content": "두 번째 텍스트 섹션입니다. 추가적인 내용이 여기에 들어갑니다. " * 15, "page": 3},
+        {
+            "type": "header",
+            "content": "# 1장 서론",
+            "page": 1,
+            "source_regions": [{
+                "page_number": 1,
+                "bounding_box": {"left": 0.5, "top": 0.5, "right": 6.0, "bottom": 1.0},
+                "polygon": [{"x": 0.5, "y": 0.5}, {"x": 6.0, "y": 0.5}, {"x": 6.0, "y": 1.0}, {"x": 0.5, "y": 1.0}],
+                "unit": "inch",
+            }],
+        },
+        {
+            "type": "text",
+            "content": "한국어 문서 분석을 위한 프레임워크입니다. " * 20,
+            "page": 1,
+            "source_regions": [{
+                "page_number": 1,
+                "bounding_box": {"left": 0.75, "top": 1.2, "right": 7.0, "bottom": 4.0},
+                "polygon": [{"x": 0.75, "y": 1.2}, {"x": 7.0, "y": 1.2}, {"x": 7.0, "y": 4.0}, {"x": 0.75, "y": 4.0}],
+                "unit": "inch",
+            }],
+        },
+        {
+            "type": "table",
+            "content": "| 항목 | 값 |\n|---|---|\n| A | 100 |",
+            "page": 2,
+            "source_regions": [{
+                "page_number": 2,
+                "bounding_box": {"left": 1.0, "top": 2.0, "right": 6.5, "bottom": 4.5},
+                "polygon": [{"x": 1.0, "y": 2.0}, {"x": 6.5, "y": 2.0}, {"x": 6.5, "y": 4.5}, {"x": 1.0, "y": 4.5}],
+                "unit": "inch",
+            }],
+        },
+        {
+            "type": "image",
+            "content": "> **[이미지/차트 설명]** 그래프 이미지",
+            "page": 2,
+            "source_regions": [{
+                "page_number": 2,
+                "bounding_box": {"left": 1.25, "top": 5.0, "right": 5.75, "bottom": 7.5},
+                "polygon": [{"x": 1.25, "y": 5.0}, {"x": 5.75, "y": 5.0}, {"x": 5.75, "y": 7.5}, {"x": 1.25, "y": 7.5}],
+                "unit": "inch",
+            }],
+        },
+        {
+            "type": "text",
+            "content": "두 번째 텍스트 섹션입니다. 추가적인 내용이 여기에 들어갑니다. " * 15,
+            "page": 3,
+            "source_regions": [{
+                "page_number": 3,
+                "bounding_box": {"left": 0.8, "top": 1.0, "right": 7.1, "bottom": 4.8},
+                "polygon": [{"x": 0.8, "y": 1.0}, {"x": 7.1, "y": 1.0}, {"x": 7.1, "y": 4.8}, {"x": 0.8, "y": 4.8}],
+                "unit": "inch",
+            }],
+        },
     ]
 
     chunks = chunker.chunk(test_segments, filename="test_doc.pdf", extra_metadata={"source": "test"})
@@ -361,6 +430,21 @@ def test_chunker_v4():
     sample = chunks[0].metadata
     for field in ["chunk_index", "total_chunks", "token_count", "char_count"]:
         T.check(f"metadata has '{field}'", field in sample, str(sample.get(field, "MISSING")))
+
+    has_source_regions = any(c.metadata.get("source_regions") for c in chunks)
+    T.check("source_regions propagated", has_source_regions)
+
+    has_chunk_type = any(c.metadata.get("chunk_type") for c in chunks)
+    T.check("chunk_type normalized", has_chunk_type)
+
+    has_page_number = any(c.metadata.get("page_number") for c in chunks)
+    T.check("page_number normalized", has_page_number)
+
+    table_chunk_with_bbox = next((c for c in table_chunks if c.metadata.get("bounding_box")), None)
+    T.check("table chunk keeps bounding_box", table_chunk_with_bbox is not None, str(table_chunk_with_bbox.metadata if table_chunk_with_bbox else {}))
+
+    source_file_values = [c.metadata.get("source_file") for c in chunks if c.metadata.get("source_file")]
+    T.check("source_file normalized", any(value == "test" for value in source_file_values), str(source_file_values[:3]))
 
     # 문서 분류 테스트
     strategy = chunker._classify_document("test_report.pdf", test_segments)
@@ -815,6 +899,19 @@ def test_guardrail_scenarios():
     agent.faithfulness_checker = FaithfulnessChecker(fake, threshold=Config.FAITHFULNESS_THRESHOLD)
     agent.hallucination_detector = HallucinationDetector(fake, threshold=Config.HALLUCINATION_THRESHOLD)
 
+    citation_search_result = SearchResult(
+        content="담당자는 홍길동입니다.",
+        source="staff.pdf",
+        score=0.88,
+        metadata={"citation": "staff.pdf | p.3 | bbox: 0.80,1.00,7.10,4.80"},
+    )
+
+    exact_label = agent._build_exact_citation_label(citation_search_result)
+    T.check("exact citation label includes page", "p.3" in exact_label and "bbox:" in exact_label, exact_label)
+
+    appended = agent._append_exact_citations("홍길동", [citation_search_result])
+    T.check("append_exact_citations appends detail", "[출처: staff.pdf | p.3 | bbox:" in appended, appended)
+
     agent.retrieval_gate.soft_mode = False
     blocked = agent._run_guardrailed_answer(
         "올해 경제 전망은?",
@@ -841,12 +938,12 @@ def test_guardrail_scenarios():
 
     extraction = agent._run_guardrailed_answer(
         "담당자 이름은 무엇인가요?",
-        [SearchResult(content="담당자는 홍길동입니다.", source="staff.pdf", score=0.88)],
+        [citation_search_result],
         search_queries=["담당자 이름은 무엇인가요?"],
     )
     T.check(
         "scenario: extraction answer exact",
-        extraction.answer.startswith("홍길동") and "[출처: staff.pdf]" in extraction.answer,
+        extraction.answer.startswith("홍길동") and "[출처: staff.pdf | p.3 | bbox:" in extraction.answer,
         extraction.answer,
     )
 
@@ -859,11 +956,12 @@ def test_guardrail_scenarios():
 
     agent._prepare_search = lambda question, use_query_rewrite: [question]
     agent._vector_search = lambda question, search_queries, top_k: [
-        SearchResult(content="담당자는 홍길동입니다.", source="staff.pdf", score=0.88)
+        citation_search_result
     ]
     artifacts = agent.answer_question("담당자 이름은 무엇인가요?", return_artifacts=True, use_query_rewrite=False)
     T.check("answer_question return_artifacts", hasattr(artifacts, "diagnostics"), str(type(artifacts)))
     T.check("answer_question diagnostics populated", artifacts.diagnostics.get("search_result_count") == 1, str(artifacts.diagnostics))
+    T.check("answer_question exact citation appended", "[출처: staff.pdf | p.3 | bbox:" in artifacts.answer, artifacts.answer)
 
     try:
         agent.answer_question("충돌 테스트", return_artifacts=True, return_context=True)
@@ -922,6 +1020,7 @@ def test_vector_store():
     print("=" * 70)
 
     from azure_korean_doc_framework.config import Config
+    from azure_korean_doc_framework.core.schema import Document
 
     if not Config.SEARCH_KEY:
         T.skip("VectorStore 초기화", "AZURE_SEARCH_KEY 미설정")
@@ -936,6 +1035,21 @@ def test_vector_store():
         return
 
     from azure_korean_doc_framework.core.vector_store import VectorStore
+
+    citation_value = VectorStore._build_citation_value(
+        Document(
+            page_content="테스트",
+            metadata={
+                "page_number": 2,
+                "bounding_box": {"left": 1.0, "top": 2.0, "right": 3.5, "bottom": 4.0},
+            },
+        ),
+        "test.pdf",
+    )
+    T.check("citation value includes page and bbox", "p.2" in citation_value and "bbox:" in citation_value, citation_value)
+
+    serialized_regions = VectorStore._json_dumps([{"page_number": 2}])
+    T.check("json dump preserves unicode json", serialized_regions == '[{"page_number": 2}]', serialized_regions)
 
     try:
         vs = VectorStore()
