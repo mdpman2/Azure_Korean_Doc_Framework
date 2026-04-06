@@ -849,6 +849,9 @@ def test_guardrails_v42():
     T.check("FaithfulnessChecker init", faith is not None)
     T.check("HallucinationDetector init", hallucination is not None)
 
+    heuristic_faith = faith.verify("홍길동\n\n[출처: staff.pdf]", ["담당자는 홍길동입니다."])
+    T.check("faithfulness ignores citation-only suffix for short extraction", heuristic_faith.verdict == "FAITHFUL", str(heuristic_faith))
+
 
 def test_guardrail_scenarios():
     T.section("[11] Guardrail Scenarios")
@@ -945,6 +948,44 @@ def test_guardrail_scenarios():
         "scenario: extraction answer exact",
         extraction.answer.startswith("홍길동") and "[출처: staff.pdf | p.3 | bbox:" in extraction.answer,
         extraction.answer,
+    )
+
+    multi_source_extraction = agent._run_guardrailed_answer(
+        "담당자 이름은 무엇인가요?",
+        [
+            citation_search_result,
+            SearchResult(content="담당자는 홍길동입니다.", source="staff-duplicate.pdf", score=0.8),
+        ],
+        search_queries=["담당자 이름은 무엇인가요?"],
+    )
+    T.check(
+        "scenario: extraction citations limited to preferred source",
+        multi_source_extraction.answer.count("[출처:") == 1,
+        multi_source_extraction.answer,
+    )
+
+    reranked_extraction = agent._run_guardrailed_answer(
+        "영업 담당자 이름은 무엇인가요?",
+        [
+            SearchResult(content="일반 안내 문서입니다.", source="noise.pdf", score=0.99),
+            SearchResult(
+                content="영업 담당자는 홍길동입니다. 연락처는 별도 문서를 참고하세요.",
+                source="staff.pdf",
+                score=0.72,
+                metadata={"citation": "staff.pdf | p.3 | bbox: 0.80,1.00,7.10,4.80"},
+            ),
+        ],
+        search_queries=["영업 담당자 이름은 무엇인가요?"],
+    )
+    T.check(
+        "scenario: evidence reranking promotes matched source",
+        bool(reranked_extraction.search_results) and reranked_extraction.search_results[0].source == "staff.pdf",
+        str([item.source for item in reranked_extraction.search_results]),
+    )
+    T.check(
+        "scenario: diagnostics top source follows reranked evidence",
+        bool(reranked_extraction.diagnostics.get("top_sources")) and reranked_extraction.diagnostics["top_sources"][0] == "staff.pdf",
+        str(reranked_extraction.diagnostics),
     )
 
     injection = agent._run_guardrailed_answer(
@@ -1068,25 +1109,12 @@ def test_vector_store():
 def test_cli_args():
     T.section("[14] CLI v4.0 Args")
     print("\n" + "=" * 70)
-    print("⌨️ [14/14] CLI 인자 파싱 + 모드별 검증 (v4.4)")
+    print("⌨️ [14/15] CLI 인자 파싱 + 모드별 검증 (v4.6)")
     print("=" * 70)
 
-    # doc_chunk_main.py의 argparse를 시뮬레이션
-    import argparse
+    from doc_chunk_main import _build_arg_parser
 
-    arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument("-p", "--path", action="append", default=[])
-    arg_parser.add_argument("-q", "--question", type=str, default="기본 질문")
-    arg_parser.add_argument("--skip-qa", action="store_true")
-    arg_parser.add_argument("--skip-ingest", action="store_true")
-    arg_parser.add_argument("-w", "--workers", type=int, default=3)
-    from azure_korean_doc_framework.config import Config
-    arg_parser.add_argument("-m", "--model", type=str, default=Config.DEFAULT_MODEL)
-    # v4.0 옵션
-    arg_parser.add_argument("--graph-rag", action="store_true")
-    arg_parser.add_argument("--graph-mode", type=str, default="hybrid", choices=["local", "global", "hybrid", "naive"])
-    arg_parser.add_argument("--extract-entities", action="store_true")
-    arg_parser.add_argument("--graph-save", type=str, default="output/knowledge_graph.json")
+    arg_parser = _build_arg_parser()
 
     # 시나리오 1: 기본 실행
     args1 = arg_parser.parse_args([])
@@ -1095,6 +1123,8 @@ def test_cli_args():
     T.check("default: graph-mode=hybrid", args1.graph_mode == "hybrid")
     T.check("default: extract-entities=False", args1.extract_entities is False)
     T.check("default: workers=3", args1.workers == 3)
+    T.check("default: output-format=text", args1.output_format == "text")
+    T.check("default: question=None", args1.question is None)
 
     # 시나리오 2: Graph RAG 활성화
     args2 = arg_parser.parse_args(["--graph-rag", "--graph-mode", "local"])
@@ -1111,6 +1141,14 @@ def test_cli_args():
     T.check("--skip-ingest + question", args4.skip_ingest is True and args4.question == "테스트 질문")
     T.check("--graph-mode global", args4.graph_mode == "global")
 
+    # 시나리오 5: 운영용 옵션
+    args5 = arg_parser.parse_args(["--doctor", "--output-format", "json", "--save-session", "--session-id", "demo", "--resume-session", "latest"])
+    T.check("--doctor activates", args5.doctor is True)
+    T.check("--output-format json", args5.output_format == "json")
+    T.check("--save-session activates", args5.save_session is True)
+    T.check("--session-id parsed", args5.session_id == "demo")
+    T.check("--resume-session parsed", args5.resume_session == "latest")
+
     from azure_korean_doc_framework.config import Config
     Config.validate(require_openai=False, require_search=False, require_di=False)
     T.check("Config.validate mode-aware no-op", True)
@@ -1121,17 +1159,106 @@ def test_cli_args():
     T.check("document key distinguishes duplicate basenames", key1 != key2, f"{key1} vs {key2}")
     T.check("document key uses normalized separators", "/" in key1 and "\\" not in key1, key1)
 
-    # 시나리오 5: 모든 graph-mode 값 유효성
+    # 시나리오 6: 모든 graph-mode 값 유효성
     for mode in ["local", "global", "hybrid", "naive"]:
         args_mode = arg_parser.parse_args(["--graph-mode", mode])
         T.check(f"graph-mode '{mode}' valid", args_mode.graph_mode == mode)
 
-    # 시나리오 6: 잘못된 graph-mode → 에러
+    # 시나리오 7: 잘못된 graph-mode → 에러
     try:
         arg_parser.parse_args(["--graph-mode", "invalid"])
         T.check("invalid graph-mode raises error", False, "should have raised")
     except SystemExit:
         T.check("invalid graph-mode raises error", True)
+
+
+def test_session_runtime_support():
+    T.section("[15] Session Runtime")
+    print("\n" + "=" * 70)
+    print("💾 [15/15] 세션 저장/복원 + doctor/status 구조")
+    print("=" * 70)
+
+    temp_root = tempfile.mkdtemp(prefix="framework-session-")
+    try:
+        from doc_chunk_main import (
+            build_doctor_report,
+            build_status_report,
+            save_session_record,
+            load_session_record,
+        )
+
+        request_payload = {
+            "question": "테스트 질문",
+            "model": "gpt-5.4",
+            "qa_mode": "standard",
+        }
+        response_payload = {
+            "answer": "테스트 답변",
+            "diagnostics": {"search_result_count": 2},
+            "steps": [{"name": "generation", "passed": True}],
+        }
+
+        session, session_path = save_session_record(
+            request_payload=request_payload,
+            response_payload=response_payload,
+            base_dir=temp_root,
+            session_id="demo-session",
+        )
+        T.check("session file created", os.path.exists(session_path), session_path)
+        T.check("session run_count == 1", session.get("run_count") == 1, str(session.get("run_count")))
+        T.check("session id preserved", session.get("session_id") == "demo-session", str(session.get("session_id")))
+
+        loaded_session, loaded_path = load_session_record("latest", base_dir=temp_root)
+        T.check("load latest returns same path", loaded_path == session_path, f"{loaded_path} vs {session_path}")
+        T.check("load latest keeps question", loaded_session.get("last_request", {}).get("question") == "테스트 질문")
+
+        status_report = build_status_report(base_dir=temp_root)
+        latest_session = status_report.get("sessions", {}).get("latest") or {}
+        T.check("status report session_count == 1", status_report.get("sessions", {}).get("session_count") == 1)
+        T.check("status latest session id", latest_session.get("session_id") == "demo-session", str(latest_session))
+
+        doctor_report = build_doctor_report(
+            require_openai=False,
+            require_search=False,
+            require_di=False,
+            base_dir=temp_root,
+        )
+        T.check("doctor report has checks", len(doctor_report.get("checks", [])) > 0, str(len(doctor_report.get("checks", []))))
+        T.check("doctor report ok without env requirements", doctor_report.get("ok") is True, str(doctor_report.get("ok")))
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_search_runtime_mapping():
+    T.section("[16] Search Mapping")
+    print("\n" + "=" * 70)
+    print("🗺️ [16/16] 라이브 인덱스 필드 매핑 자동 보정")
+    print("=" * 70)
+
+    from types import SimpleNamespace
+    from azure_korean_doc_framework.utils.search_schema import _resolve_mapping_from_index
+
+    fake_index = SimpleNamespace(
+        name="idx-demo",
+        fields=[
+            SimpleNamespace(name="chunk_id"),
+            SimpleNamespace(name="parent_id"),
+            SimpleNamespace(name="chunk"),
+            SimpleNamespace(name="title"),
+            SimpleNamespace(name="text_vector"),
+        ],
+        semantic_search=SimpleNamespace(
+            configurations=[SimpleNamespace(name="sp-semantic-config")]
+        ),
+    )
+
+    resolved = _resolve_mapping_from_index(fake_index)
+    mapping = resolved.get("mapping", {})
+    T.check("resolved id field == chunk_id", mapping.get("SEARCH_ID_FIELD") == "chunk_id", str(mapping))
+    T.check("resolved content field == chunk", mapping.get("SEARCH_CONTENT_FIELD") == "chunk", str(mapping))
+    T.check("resolved vector field == text_vector", mapping.get("SEARCH_VECTOR_FIELD") == "text_vector", str(mapping))
+    T.check("resolved title field == title", mapping.get("SEARCH_TITLE_FIELD") == "title", str(mapping))
+    T.check("resolved semantic config == sp-semantic-config", mapping.get("SEARCH_SEMANTIC_CONFIG") == "sp-semantic-config", str(mapping))
 
 
 # ==================== 메인 실행 ====================
@@ -1165,6 +1292,8 @@ def main():
     _safe_run(test_chunk_logger, "ChunkLogger")
     _safe_run(test_vector_store, "VectorStore")
     _safe_run(test_cli_args, "CLI Args")
+    _safe_run(test_session_runtime_support, "Session Runtime")
+    _safe_run(test_search_runtime_mapping, "Search Runtime Mapping")
 
     return T.summary()
 
