@@ -15,6 +15,7 @@ from azure.search.documents.indexes.models import (
     SemanticSearch
 )
 from ..utils.azure_clients import AzureClientFactory
+from ..utils.search_schema import apply_search_runtime_mapping
 from ..config import Config
 from .schema import Document
 
@@ -40,6 +41,7 @@ class VectorStore:
             index_name: 사용할 AI Search 인덱스명. 생략 시 Config.SEARCH_INDEX_NAME 사용.
         """
         self.index_name = index_name or Config.SEARCH_INDEX_NAME
+        apply_search_runtime_mapping(self.index_name)
         self.index_client = AzureClientFactory.get_search_index_client()
         self.search_client = AzureClientFactory.get_search_client(self.index_name)
 

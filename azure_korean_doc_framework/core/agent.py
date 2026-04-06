@@ -1,5 +1,6 @@
 import json
 import hashlib
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 from azure.search.documents.models import VectorizedQuery
 from .multi_model_manager import MultiModelManager
@@ -14,6 +15,7 @@ from ..guardrails.injection import PromptInjectionDetector
 from ..guardrails.faithfulness import FaithfulnessChecker
 from ..guardrails.hallucination import HallucinationDetector
 from ..guardrails.question_classifier import QuestionClassifier
+from ..utils.search_schema import apply_search_runtime_mapping
 
 # 공통 RAG 시스템 프롬프트 (answer_question / graph_enhanced_answer 공유)
 _RAG_SYSTEM_PROMPT = (
@@ -38,6 +40,11 @@ class KoreanDocAgent:
     Azure AI Search의 Hybrid Search (BM25 키워드 + Vector 유사성 + Semantic Ranking)을 활용하여
     문맥을 찾고, GPT-5.4를 통해 지능적인 답변을 생성합니다.
 
+    [2026-04 v4.6 업데이트]
+    - live Azure AI Search 인덱스 스키마를 조회해 런타임 필드 매핑 자동 적용
+    - evidence 기반 답변에서 citation 수를 제한하고 근거 문서를 diagnostics 상단으로 재정렬
+    - faithfulness / hallucination 검증에서 citation 라인을 제외한 answer body 사용
+
     [2026-02 v4.1 업데이트 - Contextual Retrieval]
     - Contextual Retrieval (Anthropic 방식): 청크에 맥락 추가하여 BM25 + 벡터 검색 동시 개선
     - Hybrid Search: BM25 키워드 검색 + Vector 유사성 검색 결합 (Reciprocal Rank Fusion)
@@ -57,6 +64,7 @@ class KoreanDocAgent:
                       기본값: Config.DEFAULT_MODEL (gpt-5.4)
             graph_manager: KnowledgeGraphManager 인스턴스 (Graph RAG 사용 시)
         """
+        apply_search_runtime_mapping()
         self.model_manager = MultiModelManager(default_model=model_key or Config.DEFAULT_MODEL)
         self.search_client = AzureClientFactory.get_search_client()
 
@@ -173,7 +181,7 @@ class KoreanDocAgent:
             fields=Config.SEARCH_VECTOR_FIELD,
         )
 
-        select_fields = list(dict.fromkeys([
+        select_fields = [field_name for field_name in list(dict.fromkeys([
             Config.SEARCH_ID_FIELD,
             Config.SEARCH_CONTENT_FIELD,
             Config.SEARCH_ORIGINAL_CONTENT_FIELD,
@@ -182,7 +190,7 @@ class KoreanDocAgent:
             Config.SEARCH_CITATION_FIELD,
             Config.SEARCH_BOUNDING_BOX_FIELD,
             Config.SEARCH_SOURCE_REGIONS_FIELD,
-        ]))
+        ])) if field_name]
 
         deduplicated_results = {}
 
@@ -224,9 +232,9 @@ class KoreanDocAgent:
                         score=score,
                         metadata={
                             "raw_chunk": r.get(Config.SEARCH_CONTENT_FIELD, ''),
-                            "citation": r.get(Config.SEARCH_CITATION_FIELD, ''),
-                            "bounding_box": self._loads_json_value(r.get(Config.SEARCH_BOUNDING_BOX_FIELD)),
-                            "source_regions": self._loads_json_value(r.get(Config.SEARCH_SOURCE_REGIONS_FIELD)),
+                            "citation": r.get(Config.SEARCH_CITATION_FIELD, '') if Config.SEARCH_CITATION_FIELD else '',
+                            "bounding_box": self._loads_json_value(r.get(Config.SEARCH_BOUNDING_BOX_FIELD)) if Config.SEARCH_BOUNDING_BOX_FIELD else None,
+                            "source_regions": self._loads_json_value(r.get(Config.SEARCH_SOURCE_REGIONS_FIELD)) if Config.SEARCH_SOURCE_REGIONS_FIELD else None,
                         },
                     )
 
@@ -270,36 +278,78 @@ class KoreanDocAgent:
             return f"[출처: {citation}]"
         return f"[출처: {result.source}]"
 
+    def _answer_body_without_citations(self, answer: str) -> str:
+        """Strip trailing citation lines so downstream validators score only the answer body."""
+        filtered_lines = []
+        for raw_line in (answer or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("[출처:"):
+                continue
+            filtered_lines.append(line)
+        return "\n".join(filtered_lines).strip()
+
+    def _limit_citation_candidates(
+        self,
+        search_results: List[SearchResult],
+        preferred_sources: Optional[List[str]] = None,
+        max_citations: int = 2,
+    ) -> List[SearchResult]:
+        """Select a small, source-deduplicated citation set, preferring evidence-matched sources."""
+        if not search_results:
+            return []
+
+        preferred = set(preferred_sources or [])
+        selected = []
+        seen_sources = set()
+
+        if preferred:
+            for result in search_results:
+                if result.source not in preferred or result.source in seen_sources:
+                    continue
+                selected.append(result)
+                seen_sources.add(result.source)
+                if len(selected) >= max(1, len(preferred_sources or [])):
+                    break
+            if selected:
+                return selected
+
+        for result in search_results:
+            if result.source in seen_sources:
+                continue
+            selected.append(result)
+            seen_sources.add(result.source)
+            if len(selected) >= max_citations:
+                break
+        return selected
+
     def _append_exact_citations(
         self,
         answer: str,
         search_results: List[SearchResult],
         preferred_sources: Optional[List[str]] = None,
+        max_citations: int = 2,
     ) -> str:
         if not Config.EXACT_CITATION_ENABLED or not search_results:
             return answer
 
-        preferred = set(preferred_sources or [])
+        answer_body = self._answer_body_without_citations(answer)
+        citation_candidates = self._limit_citation_candidates(
+            search_results,
+            preferred_sources=preferred_sources,
+            max_citations=max_citations,
+        )
         citation_labels = []
         seen = set()
-        for result in search_results:
-            if preferred and result.source not in preferred:
-                continue
+        for result in citation_candidates:
             label = self._build_exact_citation_label(result)
-            if label in answer:
+            if label in answer_body or label in answer:
                 continue
             if label in seen:
                 continue
             seen.add(label)
             citation_labels.append(label)
-
-        if not citation_labels and preferred:
-            for result in search_results:
-                label = self._build_exact_citation_label(result)
-                if label in seen:
-                    continue
-                seen.add(label)
-                citation_labels.append(label)
 
         if not citation_labels:
             return answer
@@ -311,6 +361,70 @@ class KoreanDocAgent:
 
     def _format_contexts(self, results: List[SearchResult]) -> List[str]:
         return [f"[출처: {item.source}]\n{item.content}" for item in results]
+
+    def _normalize_match_text(self, text: str) -> str:
+        return " ".join((text or "").split()).strip().lower()
+
+    def _extract_query_terms(self, question: str) -> List[str]:
+        stopwords = {
+            "무엇", "무엇인가요", "무엇입니까", "인가요", "입니까", "알려주세요", "알려줘",
+            "해주세요", "해줘", "관련", "대한", "에서", "질문", "답", "찾아", "찾기",
+            "이름", "성함", "담당자",
+        }
+        tokens = re.findall(r"[0-9a-zA-Z가-힣]+", question or "")
+        normalized = []
+        for token in tokens:
+            cleaned = token.strip().lower()
+            if len(cleaned) <= 1:
+                continue
+            if cleaned in stopwords:
+                continue
+            normalized.append(cleaned)
+        return list(dict.fromkeys(normalized))
+
+    def _rerank_search_results_for_evidence(
+        self,
+        question: str,
+        search_results: List[SearchResult],
+        evidence_used,
+        question_category: str,
+    ) -> List[SearchResult]:
+        """Promote documents that contain the extracted answer or evidence sentences.
+
+        Retrieval score is kept as a tiebreaker, but evidence-matched sources are
+        surfaced first so diagnostics and citation selection reflect the actual
+        grounding document more closely.
+        """
+        if not search_results or evidence_used is None:
+            return search_results
+
+        normalized_answer = self._normalize_match_text(evidence_used.answer)
+        normalized_evidence = [self._normalize_match_text(sentence) for sentence in evidence_used.evidence_sentences if sentence]
+        preferred_sources = set(evidence_used.sources or [])
+        query_terms = self._extract_query_terms(question)
+
+        def evidence_rank(result: SearchResult) -> tuple:
+            normalized_content = self._normalize_match_text(result.content)
+            normalized_source = self._normalize_match_text(result.source)
+            boost = 0.0
+            matched_evidence_count = 0
+
+            if result.source in preferred_sources:
+                boost += 100.0
+            if normalized_answer and normalized_answer in normalized_content:
+                boost += 20.0
+            for sentence in normalized_evidence:
+                if sentence and sentence in normalized_content:
+                    matched_evidence_count += 1
+                    boost += 12.0
+
+            if question_category == "extraction":
+                keyword_overlap = sum(1 for term in query_terms if term in normalized_content or term in normalized_source)
+                boost += keyword_overlap * 2.0
+
+            return (boost, matched_evidence_count, result.score)
+
+        return sorted(search_results, key=evidence_rank, reverse=True)
 
     def _build_diagnostics(
         self,
@@ -327,6 +441,7 @@ class KoreanDocAgent:
         query_variants = search_queries or [question]
         top_score = max((item.score for item in search_results), default=0.0)
         resolved_model_key = model_key or getattr(self.model_manager, "default_model", Config.DEFAULT_MODEL)
+        unique_top_sources = list(dict.fromkeys(item.source for item in search_results if item.source))[:3]
         return {
             "question_length": len(question),
             "model_key": resolved_model_key,
@@ -335,7 +450,7 @@ class KoreanDocAgent:
             "query_variants": query_variants,
             "search_result_count": len(search_results),
             "top_score": top_score,
-            "top_sources": [item.source for item in search_results[:3]],
+            "top_sources": unique_top_sources,
             "graph_context_used": graph_context_used,
             "gate_reason": gate_reason,
         }
@@ -447,7 +562,8 @@ class KoreanDocAgent:
             detail={"category": question_type.category, "reason": question_type.reason},
         ))
 
-        contexts = self._format_contexts(search_results)
+        effective_results = list(search_results)
+        contexts = self._format_contexts(effective_results)
         answer = ""
         evidence_used = None
         if Config.EXACT_CITATION_ENABLED and search_results:
@@ -457,8 +573,20 @@ class KoreanDocAgent:
                 evidence_used = self.evidence_extractor.extract_short_answer(question, search_results, model_key=model_key)
 
         if evidence_used is not None:
+            effective_results = self._rerank_search_results_for_evidence(
+                question,
+                search_results,
+                evidence_used,
+                question_type.category,
+            )
+            contexts = self._format_contexts(effective_results)
             answer = evidence_used.answer
-            answer = self._append_exact_citations(answer, search_results, preferred_sources=evidence_used.sources)
+            answer = self._append_exact_citations(
+                answer,
+                effective_results,
+                preferred_sources=evidence_used.sources,
+                max_citations=1 if question_type.category == "extraction" else 2,
+            )
             steps.append(PipelineStep(
                 name="evidence_extraction",
                 passed=True,
@@ -481,7 +609,7 @@ class KoreanDocAgent:
             ))
 
         if Config.NUMERIC_VERIFICATION_ENABLED and answer and search_results:
-            verification = self.numeric_verifier.verify(answer, [item.content for item in search_results])
+            verification = self.numeric_verifier.verify(answer, [item.content for item in effective_results])
             steps.append(PipelineStep(
                 name="numeric_verification",
                 passed=verification.passed,
@@ -492,7 +620,11 @@ class KoreanDocAgent:
             ))
 
         if Config.FAITHFULNESS_ENABLED and answer and search_results:
-            faithfulness = self.faithfulness_checker.verify(answer, [item.content for item in search_results], model_key=model_key)
+            faithfulness = self.faithfulness_checker.verify(
+                self._answer_body_without_citations(answer),
+                [item.content for item in effective_results],
+                model_key=model_key,
+            )
             steps.append(PipelineStep(
                 name="faithfulness",
                 passed=faithfulness.verdict == "FAITHFUL",
@@ -503,7 +635,11 @@ class KoreanDocAgent:
             ))
 
         if Config.HALLUCINATION_DETECTION_ENABLED and answer and search_results:
-            hallucination = self.hallucination_detector.verify(answer, [item.content for item in search_results], model_key=model_key)
+            hallucination = self.hallucination_detector.verify(
+                self._answer_body_without_citations(answer),
+                [item.content for item in effective_results],
+                model_key=model_key,
+            )
             steps.append(PipelineStep(
                 name="hallucination",
                 passed=hallucination.verdict == "PASS",
@@ -513,12 +649,17 @@ class KoreanDocAgent:
                 },
             ))
 
-        answer = self._append_exact_citations(answer, search_results)
+        if evidence_used is None:
+            answer = self._append_exact_citations(
+                answer,
+                effective_results,
+                max_citations=1 if question_type.category == "extraction" else 2,
+            )
 
         return self._finalize_artifacts(
             question=question,
             search_queries=search_queries,
-            search_results=search_results,
+            search_results=effective_results,
             answer=answer,
             contexts=contexts,
             steps=steps,

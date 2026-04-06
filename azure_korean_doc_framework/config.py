@@ -19,6 +19,10 @@ class Config:
     - `AZURE_OPENAI_*` 와 `OPEN_AI_*` 별칭을 함께 지원
     - 고성능 endpoint/key는 기본 endpoint/key와 동일 값 사용 가능
 
+    [2026-04 v4.6]
+    - doctor/status/session CLI가 그대로 참조하는 운영 설정 집합
+    - Azure AI Search 필드명은 런타임 스키마 조회 결과로 자동 보정될 수 있음
+
     [2026-02 v4.0]
     - Graph RAG 지원 (LightRAG 기반 Knowledge Graph)
     - 구조화 엔티티 추출 (LangExtract 기반)
