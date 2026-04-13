@@ -216,6 +216,21 @@ class VectorStore:
                 )
                 updated = True
 
+            # [v5.1-fix] 제목/소스 필드가 기존 인덱스에 없을 경우 동적 추가
+            if Config.SEARCH_TITLE_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_TITLE_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(
+                    SearchField(name=Config.SEARCH_TITLE_FIELD, type=SearchFieldDataType.String, searchable=True)
+                )
+                updated = True
+
+            if Config.SEARCH_SOURCE_FIELD and Config.SEARCH_SOURCE_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_SOURCE_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(
+                    SearchField(name=Config.SEARCH_SOURCE_FIELD, type=SearchFieldDataType.String, searchable=True, filterable=True)
+                )
+                updated = True
+
             # 시맨틱 검색 설정 확인 및 추가
             if not index.semantic_search or not any(
                 c.name == Config.SEARCH_SEMANTIC_CONFIG for c in index.semantic_search.configurations
@@ -252,9 +267,9 @@ class VectorStore:
         # page_content에는 맥락이 이미 포함되어 있음 (Contextual Embeddings + Contextual BM25)
         texts = [chunk.page_content for chunk in chunks]
 
-        # 배치 임베딩 (한 번에 2048개까지 처리 가능하나, API 안정성을 위해 50개 단위 처리)
+        # 배치 임베딩 (한 번에 2048개까지 처리 가능하나, API 안정성과 속도 균형점: 500개 단위)
         vectors = []
-        batch_size = 50
+        batch_size = 500
         for batch_texts in self._batched(texts, batch_size):
             response = self.openai_client.embeddings.create(
                 input=batch_texts,
@@ -285,11 +300,24 @@ class VectorStore:
                 document[Config.SEARCH_SOURCE_FIELD] = title
             documents.append(document)
 
-        # 3. 50개 단위로 나누어 업로드 (배치 처리)
-        for batch in self._batched(documents, 50):
-            self.search_client.upload_documents(batch)
+        # 3. 문서 업로드 (배치 처리)
+        failed_count = 0
+        for batch_idx, batch in enumerate(self._batched(documents, 50)):
+            try:
+                result = self.search_client.upload_documents(batch)
+                errors = [r for r in result if not r.succeeded]
+                if errors:
+                    failed_count += len(errors)
+                    print(f"   ⚠️ 배치 {batch_idx + 1}: {len(errors)}개 문서 업로드 실패")
+            except Exception as e:
+                failed_count += len(batch)
+                print(f"   ❌ 배치 {batch_idx + 1} 업로드 오류: {e}")
 
-        print(f"✅ {len(documents)}개 업로드 완료.")
+        success_count = len(documents) - failed_count
+        if failed_count:
+            print(f"⚠️ {success_count}/{len(documents)}개 업로드 완료 ({failed_count}개 실패)")
+        else:
+            print(f"✅ {len(documents)}개 업로드 완료.")
 
     def is_file_up_to_date(self, file_name: str, file_mod_time: float, file_hash: Optional[str] = None) -> bool:
         """

@@ -9,6 +9,8 @@ from .hooks import HookEvent, HookRegistry
 from .error_recovery import ErrorRecoveryManager, RetryPolicy
 from .streaming import ContextCompactor, StreamChunk, StreamingManager
 from .web_tools import WebFetchTool, WebSearchTool
+from .reranker import Reranker, RerankerResult
+from .llm_cache import LLMResponseCache
 from ..utils.azure_clients import AzureClientFactory
 from ..config import Config
 from ..generation.evidence_extractor import EvidenceExtractor
@@ -137,14 +139,31 @@ class KoreanDocAgent:
             max_chars=Config.WEB_FETCH_MAX_CHARS,
         ) if Config.WEB_SEARCH_ENABLED else None
 
-        # 에러 자동 복구 매니저
-        self.error_recovery = ErrorRecoveryManager(
-            RetryPolicy(
-                max_retries=Config.ERROR_RECOVERY_MAX_RETRIES,
-                base_delay=Config.ERROR_RECOVERY_BASE_DELAY,
-                fallback_models=[m.strip() for m in Config.ERROR_RECOVERY_FALLBACK_MODELS if m.strip()],
-            )
-        ) if Config.ERROR_RECOVERY_ENABLED else None
+        # [v5.1-fix] 에러 자동 복구는 MultiModelManager.get_completion_with_retry() 내부에서
+        # ErrorRecoveryManager를 자체 생성하므로, agent 수준에서 별도 인스턴스를 유지하지 않음.
+        # (기존 self.error_recovery는 dead code였음)
+
+        # [v5.1] Reranker (LightRAG 참조 — Cross-Encoder/Jina/LLM)
+        self.reranker = Reranker(
+            backend=Config.RERANKER_BACKEND,
+            model_name=Config.RERANKER_MODEL,
+            jina_api_key=Config.JINA_API_KEY,
+            top_k=Config.RERANKER_TOP_K,
+            warm_up=Config.RERANKER_WARM_UP,
+        ) if Config.RERANKER_ENABLED else None
+
+        # [v5.1] LLM 응답 캐시 (LightRAG kv_store 참조)
+        self.llm_cache = LLMResponseCache(
+            cache_dir=Config.LLM_CACHE_DIR,
+            max_memory_entries=Config.LLM_CACHE_MAX_MEMORY,
+            default_ttl=Config.LLM_CACHE_TTL,
+            enabled=Config.LLM_CACHE_ENABLED,
+        ) if Config.LLM_CACHE_ENABLED else None
+
+        # [최적화] 병렬 검색용 ThreadPoolExecutor — 매 호출마다 생성/소멸 대신 재사용
+        self._parallel_executor = ThreadPoolExecutor(
+            max_workers=Config.PARALLEL_TOOL_MAX_WORKERS
+        ) if Config.PARALLEL_TOOL_ENABLED else None
 
         # 서브에이전트 매니저 — delegate() 외부 호출 시 lazy init
         self._sub_agent_manager = None
@@ -192,7 +211,7 @@ class KoreanDocAgent:
         Returns:
             (search_results, web_context): 검색 결과 + 웹 보강 컨텍스트
         """
-        if not Config.PARALLEL_TOOL_ENABLED:
+        if not Config.PARALLEL_TOOL_ENABLED or not self._parallel_executor:
             results = self._vector_search(question, search_queries, top_k)
             web_ctx = self._web_search_augment(question) if self.web_search_tool else None
             return results, web_ctx
@@ -200,23 +219,23 @@ class KoreanDocAgent:
         vector_results = []
         web_context = None
 
-        with ThreadPoolExecutor(max_workers=Config.PARALLEL_TOOL_MAX_WORKERS) as executor:
-            future_vector = executor.submit(self._vector_search, question, search_queries, top_k)
+        executor = self._parallel_executor
+        future_vector = executor.submit(self._vector_search, question, search_queries, top_k)
 
-            future_web = None
-            if self.web_search_tool:
-                future_web = executor.submit(self._web_search_augment, question)
+        future_web = None
+        if self.web_search_tool:
+            future_web = executor.submit(self._web_search_augment, question)
 
+        try:
+            vector_results = future_vector.result(timeout=30)
+        except Exception as e:
+            print(f"   ⚠️ 벡터 검색 실패: {e}")
+
+        if future_web:
             try:
-                vector_results = future_vector.result(timeout=30)
-            except Exception as e:
-                print(f"   ⚠️ 벡터 검색 실패: {e}")
-
-            if future_web:
-                try:
-                    web_context = future_web.result(timeout=15)
-                except Exception:
-                    pass
+                web_context = future_web.result(timeout=15)
+            except Exception:
+                pass
 
         return vector_results, web_context
 
@@ -245,11 +264,16 @@ class KoreanDocAgent:
         model_key: Optional[str] = None,
         top_k: int = 5,
         use_query_rewrite: bool = True,
+        graph_query_mode: Optional[str] = None,
     ) -> Generator[StreamChunk, None, None]:
         """
-        스트리밍으로 RAG 답변을 생성합니다. [v5.0 신규]
+        스트리밍으로 RAG 답변을 생성합니다. [v5.0 신규, v5.1 Graph 지원 추가]
 
         검색 → 가드레일(injection/gate) → 스트리밍 답변 생성
+
+        Args:
+            graph_query_mode: Graph RAG 모드 (local/global/hybrid/mix/bypass).
+                             None이면 그래프 검색 비활성화.
 
         Yields:
             StreamChunk: 텍스트 청크 (is_final=True로 완료 판별)
@@ -289,6 +313,26 @@ class KoreanDocAgent:
         if web_context:
             contexts.append(f"[웹 검색 보강]\n{web_context}")
 
+        # [v5.1-fix] Graph RAG 컨텍스트 보강
+        system_prompt = _RAG_SYSTEM_PROMPT
+        if graph_query_mode and self.graph_manager and graph_query_mode != "naive":
+            try:
+                from .graph_rag import QueryMode
+                mode_map = {
+                    "local": QueryMode.LOCAL, "global": QueryMode.GLOBAL,
+                    "hybrid": QueryMode.HYBRID, "naive": QueryMode.NAIVE,
+                    "mix": QueryMode.MIX, "bypass": QueryMode.BYPASS,
+                }
+                mode = mode_map.get(graph_query_mode, QueryMode.HYBRID)
+                graph_result = self.graph_manager.query(query_text=question, mode=mode, top_k=Config.GRAPH_TOP_K)
+                if graph_result.context_text:
+                    contexts.insert(0, f"[Knowledge Graph 컨텍스트]\n{graph_result.context_text}")
+                    system_prompt = _GRAPH_RAG_SYSTEM_PROMPT
+                    print(f"   📊 Streaming Graph context: {len(graph_result.entities)} entities, "
+                          f"{len(graph_result.relationships)} relationships")
+            except Exception as e:
+                print(f"   ⚠️ Streaming graph query failed: {e}")
+
         if self.context_compactor and self.context_compactor.should_compact(contexts):
             compact_result = self.context_compactor.compact_contexts(contexts, question=question)
             contexts = [compact_result.summary]
@@ -299,7 +343,7 @@ class KoreanDocAgent:
             yield from self.streaming_manager.stream_rag_answer(
                 question=question,
                 contexts=contexts,
-                system_prompt=_RAG_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 model_key=routed_model,
             )
         else:
@@ -384,6 +428,18 @@ class KoreanDocAgent:
 
 출력 형식: ["쿼리1", "쿼리2", "쿼리3"]"""
 
+            # [v5.1] LLM 캐시 조회
+            if self.llm_cache:
+                cached = self.llm_cache.get(rewrite_prompt, model_key="query_rewrite")
+                if cached:
+                    try:
+                        queries = json.loads(cached)
+                        if isinstance(queries, list) and queries:
+                            print(f"   💾 Query rewrite 캐시 히트")
+                            return [str(q) for q in queries[:3]]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
             response = self.llm_client.chat.completions.create(
                 model=Config.MODELS.get(Config.DEFAULT_MODEL, Config.DEFAULT_MODEL),
                 messages=[{"role": "user", "content": rewrite_prompt}],
@@ -397,6 +453,9 @@ class KoreanDocAgent:
                 try:
                     queries = json.loads(result)
                     if isinstance(queries, list) and queries:
+                        # [v5.1] 캐시에 저장
+                        if self.llm_cache:
+                            self.llm_cache.put(rewrite_prompt, result, model_key="query_rewrite")
                         return [str(q) for q in queries[:3]]
                 except (json.JSONDecodeError, TypeError) as e:
                     print(f"   ⚠️ Query rewrite JSON 파싱 실패: {e} | 응답: {result[:200]}")
@@ -515,7 +574,18 @@ class KoreanDocAgent:
             key=lambda item: item.score,
             reverse=True,
         )
-        return ranked_results[:top_k * 2]
+        pre_rerank = ranked_results[:top_k * 2]
+
+        # [v5.1] Reranker 적용 (LightRAG 참조)
+        if self.reranker:
+            rerank_result = self.reranker.rerank(question, pre_rerank, top_k=top_k)
+            if rerank_result.reranked:
+                print(f"   🔄 Reranker ({rerank_result.backend_used}): "
+                      f"{rerank_result.original_count} → {rerank_result.final_count} results")
+                return rerank_result.results
+
+        # [v5.1-fix] Reranker 미사용/실패 시에도 top_k 제한 적용
+        return pre_rerank[:top_k]
 
     def _extract_search_score(self, result) -> float:
         for key in ("@search.reranker_score", "@search.score"):
@@ -718,6 +788,9 @@ class KoreanDocAgent:
             "top_sources": unique_top_sources,
             "graph_context_used": graph_context_used,
             "gate_reason": gate_reason,
+            "reranker_enabled": self.reranker is not None,
+            "reranker_backend": Config.RERANKER_BACKEND if self.reranker else "none",
+            "llm_cache_stats": self.llm_cache.get_stats() if self.llm_cache else None,
         }
 
     def _finalize_artifacts(
@@ -824,6 +897,18 @@ class KoreanDocAgent:
                 )
             if not gate_result.passed:
                 gate_reason = gate_result.reason
+
+        # [v5.1-fix] Reranker 실행 기록 (PipelineStep)
+        if self.reranker:
+            steps.append(PipelineStep(
+                name="reranker",
+                passed=True,
+                detail={
+                    "backend": Config.RERANKER_BACKEND,
+                    "top_k": Config.RERANKER_TOP_K,
+                    "input_count": len(search_results),
+                },
+            ))
 
         question_type = self.question_classifier.classify(question)
         steps.append(PipelineStep(
@@ -1081,12 +1166,15 @@ class KoreanDocAgent:
         return_artifacts: bool = False,
     ) -> Union[str, Tuple[str, List[str]], AnswerArtifacts]:
         """
-        [v4.0] Graph-Enhanced RAG: 벡터 검색 + Knowledge Graph 결합
+        [v4.0 → v5.1] Graph-Enhanced RAG: 벡터 검색 + Knowledge Graph 결합
 
         LightRAG의 Dual-Level Retrieval 개념을 적용하여:
         1. Azure AI Search 하이브리드 검색 (기존 벡터+키워드)
         2. Knowledge Graph 맥락 정보 (엔티티/관계)
         3. 두 결과를 결합하여 더 풍부한 컨텍스트로 답변 생성
+
+        [v5.1] answer_question()과 동일한 파이프라인 통합:
+        - Agent Routing, Injection Detection, Hooks, Web Search, Context Compaction
 
         Args:
             question: 사용자의 질문 문자열.
@@ -1094,7 +1182,7 @@ class KoreanDocAgent:
             return_context: True일 경우 답변과 함께 검색된 컨텍스트 리스트를 반환합니다.
             top_k: 검색할 문서의 개수 (기본값: 5).
             use_query_rewrite: Query Rewrite 사용 여부 (기본값: True).
-            graph_query_mode: Graph 검색 모드 (local/global/hybrid/naive).
+            graph_query_mode: Graph 검색 모드 (local/global/hybrid/naive/mix/bypass).
             return_artifacts: True일 경우 AnswerArtifacts 전체를 반환합니다.
 
         Returns:
@@ -1103,14 +1191,57 @@ class KoreanDocAgent:
         if return_artifacts and return_context:
             raise ValueError("return_artifacts 와 return_context 는 동시에 사용할 수 없습니다.")
 
+        # [v5.1-fix] Agent Routing — answer_question()과 동일하게 적용
+        routed_model = self._route_model_for_question(question, model_key)
+
+        # [v5.1-fix] Injection 검사를 검색 이전에 수행
+        if Config.INJECTION_DETECTION_ENABLED:
+            injection = self.injection_detector.detect(question, model_key=routed_model)
+            if injection.blocked:
+                blocked_answer = "입력 내용이 안전하지 않아 요청을 처리할 수 없습니다."
+                if return_artifacts:
+                    return self._finalize_artifacts(
+                        question=question, search_queries=[question],
+                        search_results=[], answer=blocked_answer,
+                        steps=[PipelineStep(name="prompt_injection", passed=False,
+                                            detail={"reason": injection.reason, "score": injection.score})],
+                        model_key=routed_model, graph_context_used=False,
+                    )
+                return (blocked_answer, []) if return_context else blocked_answer
+
+        # [v5.1-fix] Hook: pre_search
+        hook_data = self._run_hook(HookEvent.PRE_SEARCH, {"question": question, "model_key": routed_model, "graph_mode": graph_query_mode})
+        if hook_data is None:
+            blocked_answer = "Hook에 의해 요청이 차단되었습니다."
+            if return_artifacts:
+                return self._finalize_artifacts(
+                    question=question, search_queries=[question],
+                    search_results=[], answer=blocked_answer, model_key=routed_model,
+                )
+            return (blocked_answer, []) if return_context else blocked_answer
+
         print(f"🔎 [Graph-Enhanced] Searching for: {question}")
 
-        # === Part 1: 벡터 검색 (공통 로직) ===
+        # === Part 1: 벡터 검색 + 웹 검색 (병렬) ===
         search_queries = self._prepare_search(question, use_query_rewrite)
+        vector_results, web_context = self._parallel_search(question, search_queries, top_k)
 
-        vector_results = self._vector_search(question, search_queries, top_k)
+        # [v5.1-fix] Hook: post_search
+        self._run_hook(HookEvent.POST_SEARCH, {
+            "question": question, "result_count": len(vector_results),
+            "web_context": web_context, "graph_mode": graph_query_mode,
+        })
 
-        # === Part 2: Knowledge Graph 검색 (v4.0 신규) ===
+        # [v5.1-fix] 웹 검색 결과 추가
+        if web_context:
+            vector_results.append(SearchResult(
+                content=web_context,
+                source="web_search",
+                score=0.5,
+                metadata={"web": True},
+            ))
+
+        # === Part 2: Knowledge Graph 검색 (v4.0 → v4.7 Mix/Bypass 지원) ===
         graph_context = ""
         if self.graph_manager and graph_query_mode != "naive":
             try:
@@ -1120,6 +1251,8 @@ class KoreanDocAgent:
                     "global": QueryMode.GLOBAL,
                     "hybrid": QueryMode.HYBRID,
                     "naive": QueryMode.NAIVE,
+                    "mix": QueryMode.MIX,         # [v5.1-fix] v4.7 모드 추가
+                    "bypass": QueryMode.BYPASS,    # [v5.1-fix] v4.7 모드 추가
                 }
                 mode = mode_map.get(graph_query_mode, QueryMode.HYBRID)
 
@@ -1137,38 +1270,38 @@ class KoreanDocAgent:
                 print(f"   ⚠️ Graph query failed: {e}")
 
         # === Part 3: 결합된 컨텍스트로 답변 생성 ===
-        vector_contexts = self._format_contexts(vector_results)
-        vector_context_str = "\n\n".join(vector_contexts)
-
-        if not vector_context_str and not graph_context:
-            print("   ⚠️ No relevant documentation found.")
-            vector_context_str = "관련된 문서 내용을 찾을 수 없습니다."
-
-        # Graph 컨텍스트가 있으면 추가
-        combined_context = vector_context_str
-        if graph_context:
-            combined_context = (
-                f"[문서 검색 결과]\n{vector_context_str}\n\n"
-                f"[Knowledge Graph 분석]\n{graph_context}"
-            )
-
+        # [v5.1-fix] graph 결과는 보조 컨텍스트이므로 score=0.0으로 설정.
+        # score=1.0으로 넣으면 retrieval gate를 무조건 통과시키고
+        # evidence extractor 점수 순위를 왜곡하는 문제가 있었음.
         augmented_results = list(vector_results)
         if graph_context:
             augmented_results.insert(0, SearchResult(
                 content=graph_context,
                 source="knowledge_graph",
-                score=1.0,
+                score=0.0,
                 metadata={"graph": True},
             ))
+
+        # [v5.1-fix] 자동 컨텍스트 압축
+        if self.context_compactor:
+            raw_contexts = self._format_contexts(augmented_results)
+            if self.context_compactor.should_compact(raw_contexts):
+                compact_result = self.context_compactor.compact_contexts(raw_contexts, question=question)
+                print(f"   🗜️ 컨텍스트 압축: {compact_result.original_token_count} → {compact_result.compacted_token_count} tokens")
 
         artifacts = self._run_guardrailed_answer(
             question,
             augmented_results,
-            model_key=model_key,
+            model_key=routed_model,
             system_prompt=_GRAPH_RAG_SYSTEM_PROMPT,
             search_queries=search_queries,
             graph_context_used=bool(graph_context),
         )
+
+        # [v5.1-fix] Hook: post_generation
+        self._run_hook(HookEvent.POST_GENERATION, {
+            "question": question, "answer": artifacts.answer, "graph_context_used": bool(graph_context),
+        })
 
         if return_artifacts:
             return artifacts

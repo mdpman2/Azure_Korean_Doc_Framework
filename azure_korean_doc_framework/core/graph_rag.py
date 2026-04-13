@@ -324,6 +324,7 @@ class KnowledgeGraphManager:
         max_entities_per_chunk: int = 20,
         gleaning_passes: int = 1,
         mix_graph_weight: float = 0.4,
+        llm_cache=None,
     ):
         if not HAS_NETWORKX:
             raise ImportError(
@@ -354,6 +355,10 @@ class KnowledgeGraphManager:
         self._entity_keyword_index: Dict[str, set] = {}  # keyword → {entity_name, ...}
         self._relation_keyword_index: Dict[str, set] = {}  # keyword → {(source, target), ...}
 
+        # [최적화] 문자 기반 사전 필터링 인덱스 — O(N) 폴백 제거
+        self._entity_name_char_index: Dict[str, set] = {}  # char → {entity_name, ...}
+        self._edge_desc_char_index: Dict[str, set] = {}    # char → {(source, target), ...}
+
         # [v4.7] 정규화명 → 원래 이름 역매핑 (Entity Normalization)
         self._normalized_name_map: Dict[str, str] = {}  # normalized → canonical name
 
@@ -364,6 +369,9 @@ class KnowledgeGraphManager:
         # [v4.7] Knowledge Injection 저장소
         self._injections: Dict[str, KnowledgeInjection] = {}
         self._synonym_map: Dict[str, str] = {}  # synonym → canonical term
+
+        # [v5.1] LLM 캐시 (엔티티 추출 비용 절감)
+        self._llm_cache = llm_cache
 
         print(f"📊 KnowledgeGraphManager 초기화 (모델: {model_key}, 엔티티 타입: {len(self.entity_types)}개, "
               f"Gleaning: {gleaning_passes}회, Mix 가중치: {mix_graph_weight})")
@@ -461,15 +469,31 @@ class KnowledgeGraphManager:
         batch_text: str,
         source_label: str,
     ) -> Tuple[List[Entity], List[Relationship]]:
-        """단일 추출 패스 실행"""
+        """단일 추출 패스 실행 ([v5.1] LLM 캐시 지원)"""
         entities = []
         relationships = []
+
+        user_content = f"다음 텍스트에서 엔티티와 관계를 추출하세요:\n\n{batch_text}"
+
+        # [v5.1] LLM 캐시: 동일 배치 텍스트에 대한 중복 추출 방지
+        if self._llm_cache:
+            cached = self._llm_cache.get(
+                prompt=user_content,
+                model=self.model_name,
+                system_message=system_prompt,
+            )
+            if cached is not None:
+                try:
+                    result = json.loads(cached)
+                    return self._parse_extraction_result(result, source_label)
+                except (json.JSONDecodeError, TypeError):
+                    pass  # 캐시 데이터 손상 — LLM 호출로 진행
 
         completion_params = {
             "model": self.model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"다음 텍스트에서 엔티티와 관계를 추출하세요:\n\n{batch_text}"}
+                {"role": "user", "content": user_content}
             ],
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
@@ -483,12 +507,32 @@ class KnowledgeGraphManager:
         response = self.client.chat.completions.create(**completion_params)
         result_text = response.choices[0].message.content
 
+        # [v5.1] LLM 캐시에 응답 저장
+        if self._llm_cache and result_text:
+            self._llm_cache.put(
+                prompt=user_content,
+                model=self.model_name,
+                system_message=system_prompt,
+                response=result_text,
+            )
+
         # [v4.7-fix] LLM 응답 JSON 파싱 보호
         try:
             result = json.loads(result_text)
         except (json.JSONDecodeError, TypeError) as e:
             print(f"   ⚠️ 엔티티 추출 JSON 파싱 실패 (batch '{source_label}'): {e}")
             return entities, relationships
+
+        return self._parse_extraction_result(result, source_label)
+
+    def _parse_extraction_result(
+        self,
+        result: Dict[str, Any],
+        source_label: str,
+    ) -> Tuple[List[Entity], List[Relationship]]:
+        """추출 결과 JSON을 Entity/Relationship 객체로 변환합니다."""
+        entities = []
+        relationships = []
 
         for ent_data in result.get("entities", []):
             # [v4.7] Entity Normalization 적용
@@ -665,6 +709,11 @@ class KnowledgeGraphManager:
             if token:
                 self._entity_keyword_index.setdefault(token, set()).add(name)
 
+        # [최적화] 문자 기반 인덱스 업데이트 (substring 검색용)
+        for ch in set(name):
+            if ch.strip():
+                self._entity_name_char_index.setdefault(ch, set()).add(name)
+
     def _add_relationship(self, rel: Relationship) -> None:
         """관계를 그래프에 추가 (중복 시 가중치 합산) + 역색인 업데이트"""
         if self.graph.has_edge(rel.source, rel.target):
@@ -696,6 +745,10 @@ class KnowledgeGraphManager:
                 token = token.strip().strip(",")
                 if token:
                     self._relation_keyword_index.setdefault(token, set()).add(edge_key)
+            # [최적화] 문자 기반 인덱스 업데이트 (substring 검색 폴백용)
+            for ch in set(text):
+                if ch.strip():
+                    self._edge_desc_char_index.setdefault(ch, set()).add(edge_key)
 
     # ==================== Dual-Level Retrieval ====================
 
@@ -819,11 +872,19 @@ class KnowledgeGraphManager:
             # 역색인에서 정확한 토큰 매칭
             candidate_names = self._entity_keyword_index.get(keyword, set())
 
-            # 엔티티명 부분 문자열 매칭도 지원 (역색인에 없을 경우)
+            # 엔티티명 부분 문자열 매칭도 지원 (역색인에 없을 경우 — 문자 사전 필터링)
             if not candidate_names:
-                for node_name in self.graph.nodes:
-                    if keyword in node_name:
-                        candidate_names = candidate_names | {node_name}
+                pre_filtered = None
+                for ch in keyword:
+                    char_set = self._entity_name_char_index.get(ch)
+                    if char_set is None:
+                        pre_filtered = set()
+                        break
+                    pre_filtered = char_set if pre_filtered is None else pre_filtered & char_set
+                    if not pre_filtered:
+                        break
+                if pre_filtered:
+                    candidate_names = {n for n in pre_filtered if keyword in n}
 
             for node_name in candidate_names:
                 if node_name not in seen_entity_names and self.graph.has_node(node_name):
@@ -875,13 +936,25 @@ class KnowledgeGraphManager:
             # 역색인에서 정확한 토큰 매칭
             candidate_edges = self._relation_keyword_index.get(keyword, set())
 
-            # 역색인에 없으면 전체 검색 폴백
+            # 역색인에 없으면 문자 사전 필터링 기반 검색 (최적화: O(N) → O(K))
             if not candidate_edges:
-                for source, target, edge_data in self.graph.edges(data=True):
-                    desc = edge_data.get("description", "")
-                    kw = edge_data.get("keywords", "")
-                    if keyword in desc or keyword in kw:
-                        candidate_edges = candidate_edges | {(source, target)}
+                pre_filtered = None
+                for ch in keyword:
+                    char_set = self._edge_desc_char_index.get(ch)
+                    if char_set is None:
+                        pre_filtered = set()
+                        break
+                    pre_filtered = char_set if pre_filtered is None else pre_filtered & char_set
+                    if not pre_filtered:
+                        break
+                if pre_filtered:
+                    for source, target in pre_filtered:
+                        if self.graph.has_edge(source, target):
+                            edge_data = self.graph[source][target]
+                            desc = edge_data.get("description", "")
+                            kw = edge_data.get("keywords", "")
+                            if keyword in desc or keyword in kw:
+                                candidate_edges = candidate_edges | {(source, target)}
 
             for source, target in candidate_edges:
                 if self.graph.has_edge(source, target):
@@ -1334,6 +1407,8 @@ class KnowledgeGraphManager:
         self.graph.clear()
         self._entity_keyword_index.clear()
         self._relation_keyword_index.clear()
+        self._entity_name_char_index.clear()
+        self._edge_desc_char_index.clear()
         self._entity_cache.clear()
         self._communities.clear()
         self._community_summaries.clear()
@@ -1356,6 +1431,10 @@ class KnowledgeGraphManager:
                 token = token.strip()
                 if token:
                     self._entity_keyword_index.setdefault(token, set()).add(name)
+            # [최적화] 문자 기반 인덱스 재구축
+            for ch in set(name):
+                if ch.strip():
+                    self._entity_name_char_index.setdefault(ch, set()).add(name)
 
         for source, target, attrs in self.graph.edges(data=True):
             edge_key = (source, target)
@@ -1364,6 +1443,10 @@ class KnowledgeGraphManager:
                     token = token.strip().strip(",")
                     if token:
                         self._relation_keyword_index.setdefault(token, set()).add(edge_key)
+                # [최적화] 문자 기반 인덱스 재구축
+                for ch in set(text or ""):
+                    if ch.strip():
+                        self._edge_desc_char_index.setdefault(ch, set()).add(edge_key)
 
         # [v4.7] 로드 후 Community Detection 재실행
         if self.graph.number_of_nodes() >= 5:
@@ -1380,6 +1463,8 @@ class KnowledgeGraphManager:
         self._chunk_to_entities.clear()
         self._entity_keyword_index.clear()
         self._relation_keyword_index.clear()
+        self._entity_name_char_index.clear()
+        self._edge_desc_char_index.clear()
         self._normalized_name_map.clear()
         self._communities.clear()
         self._community_summaries.clear()
