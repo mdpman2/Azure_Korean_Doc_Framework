@@ -1,5 +1,5 @@
 """
-azure_korean_doc_framework v4.6 통합 CLI 실행 스크립트
+azure_korean_doc_framework v4.7 통합 CLI 실행 스크립트
 
 문서 파싱 → 청킹 → Contextual Retrieval → 인덱싱 → Q&A 테스트를 하나의 CLI로 실행합니다.
 기존 ingestion/Q&A 흐름에 더해 doctor/status, JSON 출력, 세션 저장/복원,
@@ -11,9 +11,15 @@ azure_korean_doc_framework v4.6 통합 CLI 실행 스크립트
 - `--doctor`, `--status`, `--output-format json` 운영 점검 명령
 - `--save-session`, `--resume-session` 세션 저장/복원
 
+[v4.7] EdgeQuake 참조 강화:
+- Gleaning (Multi-Pass 추출): GRAPH_GLEANING_PASSES 설정으로 추가 패스 횟수 지정
+- Mix Query Mode: GRAPH_MIX_WEIGHT로 벡터+그래프 가중 결합
+- Knowledge Injection: GRAPH_INJECTION_FILE로 도메인 용어집 자동 로딩
+
 Usage:
     python doc_chunk_main.py --path "RAG_TEST_DATA"
     python doc_chunk_main.py --path "data" --graph-rag --extract-entities
+    python doc_chunk_main.py --path "data" --graph-rag --graph-mode mix
     python doc_chunk_main.py --skip-ingest -q "질문" --model gpt-5.4
     python doc_chunk_main.py --doctor --output-format json
 """
@@ -138,7 +144,9 @@ def load_session_record(session_ref: str, base_dir: Optional[str] = None) -> Tup
 
     session_path = resolved_ref
     if not session_path.endswith(".json"):
-        session_path = os.path.join(session_dir, f"{resolved_ref}.json")
+        # [v4.7-fix] 경로 순회 방지: 세션 ID에 디렉토리 구분자 차단
+        safe_id = os.path.basename(resolved_ref)
+        session_path = os.path.join(session_dir, f"{safe_id}.json")
 
     if not os.path.exists(session_path):
         raise FileNotFoundError(f"세션 파일을 찾을 수 없습니다: {session_path}")
@@ -538,7 +546,6 @@ def process_single_file(
 
         # 2. 파싱 및 청킹
         print(f"🔄 [START] {filename}: 파일 변경 감지. 처리를 시작합니다... (key={document_key})")
-        vector_store.delete_documents_by_parent_id(document_key)
 
         parsed_segments = parser.parse(file_path)
 
@@ -554,7 +561,8 @@ def process_single_file(
         # 3. JSON 로깅 (ChunkLogger 사용)
         ChunkLogger.save_chunks_to_json(chunks, filename)
 
-        # 4. 벡터 저장소 업로드
+        # 4. 벡터 저장소: 기존 문서 삭제 후 업로드
+        vector_store.delete_documents_by_parent_id(document_key)
         vector_store.upload_documents(chunks)
         return f"✅ [SUCCESS] {filename}: {len(chunks)}개 청크 업로드 완료"
 
@@ -612,7 +620,11 @@ def process_documents(
             for f in files_to_process
         }
         for future in as_completed(future_to_file):
-            res = future.result()
+            try:
+                res = future.result()
+            except Exception as e:
+                failed_file = future_to_file[future]
+                res = f"❌ [ERROR] {failed_file}: {e}"
             print(f"   > {res}")
             results.append(res)
 
@@ -765,11 +777,23 @@ def _execute_cli(args) -> Dict[str, Any]:
     graph_summary: Dict[str, Any] = {"enabled": False}
     if args.graph_rag and HAS_GRAPH_RAG:
         print("\n--- [Graph RAG: Knowledge Graph 구축] ---")
-        graph_manager = KnowledgeGraphManager(model_key=effective_model)
+        graph_manager = KnowledgeGraphManager(
+            model_key=effective_model,
+            gleaning_passes=Config.GRAPH_GLEANING_PASSES,
+            mix_graph_weight=Config.GRAPH_MIX_WEIGHT,
+        )
         graph_path = args.graph_save
         if os.path.exists(graph_path):
             graph_manager.load_graph(graph_path)
             print("📁 기존 Knowledge Graph 로드 완료")
+
+        # [v4.7] Knowledge Injection 파일 로드 (EdgeQuake 참조)
+        injection_file = Config.GRAPH_INJECTION_FILE
+        if injection_file and os.path.exists(injection_file):
+            with open(injection_file, "r", encoding="utf-8") as f:
+                injection_text = f.read()
+            injected = graph_manager.inject_from_text(injection_text)
+            print(f"💉 Knowledge Injection: {injected}개 용어 주입 ({injection_file})")
 
         extracted_chunk_count = 0
         if will_ingest:
@@ -794,7 +818,8 @@ def _execute_cli(args) -> Dict[str, Any]:
                     graph_manager.save_graph(graph_path)
 
         stats = graph_manager.get_stats()
-        print(f"📊 Knowledge Graph 통계: 노드 {stats['nodes']}개, 엣지 {stats['edges']}개")
+        print(f"📊 Knowledge Graph 통계: 노드 {stats['nodes']}개, 엣지 {stats['edges']}개, "
+              f"커뮤니티 {stats.get('communities', 0)}개, 주입 {stats.get('injections', 0)}개")
         if stats.get('entity_types'):
             for et, count in stats['entity_types'].items():
                 print(f"   - {et}: {count}개")
