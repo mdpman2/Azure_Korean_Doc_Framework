@@ -777,10 +777,21 @@ def _execute_cli(args) -> Dict[str, Any]:
     graph_summary: Dict[str, Any] = {"enabled": False}
     if args.graph_rag and HAS_GRAPH_RAG:
         print("\n--- [Graph RAG: Knowledge Graph 구축] ---")
+        # [v5.1-fix] llm_cache를 전달하여 엔티티 추출 캐시 활용
+        _llm_cache = None
+        if Config.LLM_CACHE_ENABLED:
+            from azure_korean_doc_framework.core.llm_cache import LLMResponseCache
+            _llm_cache = LLMResponseCache(
+                cache_dir=Config.LLM_CACHE_DIR,
+                max_memory_entries=Config.LLM_CACHE_MAX_MEMORY,
+                default_ttl=Config.LLM_CACHE_TTL,
+                enabled=True,
+            )
         graph_manager = KnowledgeGraphManager(
             model_key=effective_model,
             gleaning_passes=Config.GRAPH_GLEANING_PASSES,
             mix_graph_weight=Config.GRAPH_MIX_WEIGHT,
+            llm_cache=_llm_cache,
         )
         graph_path = args.graph_save
         if os.path.exists(graph_path):

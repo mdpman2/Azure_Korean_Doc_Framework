@@ -1,4 +1,4 @@
-# azure_korean_doc_framework v4.0 — 의존성 패키지
+# azure_korean_doc_framework v5.0 — 의존성 패키지
 # 설치: pip install -r requirements.txt
 
 # ===== Azure SDK =====
@@ -16,6 +16,11 @@ kss>=6.0.0
 
 # ===== Graph RAG (v4.0) =====
 networkx>=3.4
+
+# ===== Reranker (v5.1 — LightRAG 참조) =====
+# Cross-Encoder 로컬 reranker (선택 설치: RERANKER_BACKEND=cross_encoder 사용 시)
+# pip install sentence-transformers
+# Jina Reranker는 API 기반이므로 추가 패키지 불필요
 
 # ===== 유틸리티 =====
 python-dotenv>=1.0.0

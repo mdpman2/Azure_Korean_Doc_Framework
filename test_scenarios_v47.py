@@ -162,6 +162,8 @@ def test_s2_graph_rag_core():
     mgr._chunk_to_entities = {}
     mgr._entity_keyword_index = {}
     mgr._relation_keyword_index = {}
+    mgr._entity_name_char_index = {}
+    mgr._edge_desc_char_index = {}
     mgr._normalized_name_map = {}
     mgr._communities = []
     mgr._community_summaries = {}
@@ -259,6 +261,8 @@ def test_s3_graph_rag_security_fixes():
         mgr._chunk_to_entities = {}
         mgr._entity_keyword_index = {}
         mgr._relation_keyword_index = {}
+        mgr._entity_name_char_index = {}
+        mgr._edge_desc_char_index = {}
         mgr._normalized_name_map = {}
         mgr._communities = []
         mgr._community_summaries = {}
@@ -375,6 +379,8 @@ def test_s4_edgequake_features():
         mgr._chunk_to_entities = {}
         mgr._entity_keyword_index = {}
         mgr._relation_keyword_index = {}
+        mgr._entity_name_char_index = {}
+        mgr._edge_desc_char_index = {}
         mgr._normalized_name_map = {}
         mgr._communities = []
         mgr._community_summaries = {}
@@ -962,6 +968,8 @@ def test_s14_cross_module_integration():
         mgr._chunk_to_entities = {}
         mgr._entity_keyword_index = {}
         mgr._relation_keyword_index = {}
+        mgr._entity_name_char_index = {}
+        mgr._edge_desc_char_index = {}
         mgr._normalized_name_map = {}
         mgr._communities = []
         mgr._community_summaries = {}
