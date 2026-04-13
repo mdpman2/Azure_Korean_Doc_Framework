@@ -193,7 +193,8 @@ class HybridDocumentParser:
         return metadata
 
     def _pdf_to_images(self, file_path: str, dpi: int = 200) -> Optional[List[Image.Image]]:
-        """PyMuPDF를 사용하여 PDF 페이지를 이미지로 변환합니다."""
+        """는 PDF 페이지를 이미지로 변환합니다."""
+        doc = None
         try:
             doc = fitz.open(file_path)
             images = []
@@ -206,11 +207,13 @@ class HybridDocumentParser:
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 images.append(img)
 
-            doc.close()
             return images
         except Exception as e:
             print(f"   ⚠️ PDF Image conversion failed (Visual RAG will be skipped): {e}")
             return None
+        finally:
+            if doc:
+                doc.close()
 
     def parse(self, file_path: str) -> List[Dict[str, Any]]:
         """
@@ -375,15 +378,11 @@ class HybridDocumentParser:
         """이진 탐색으로 offset이 정렬된 범위 리스트 안에 있는지 확인 (O(log N))"""
         if not ranges:
             return False
-        # ranges가 정렬되어 있다고 가정 (호출자가 start 기준 정렬)
-        idx = bisect_right(ranges, (offset,)) - 1
+        # 시작값 리스트를 기준으로 이진 탐색
+        starts = [r[0] for r in ranges]
+        idx = bisect_right(starts, offset) - 1
         if idx >= 0:
             start, end = ranges[idx]
-            if start <= offset < end:
-                return True
-        # 현재 위치 이후 범위도 확인
-        if idx + 1 < len(ranges):
-            start, end = ranges[idx + 1]
             if start <= offset < end:
                 return True
         return False

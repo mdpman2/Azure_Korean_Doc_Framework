@@ -1,10 +1,14 @@
 import json
-import hashlib
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 from azure.search.documents.models import VectorizedQuery
 from .multi_model_manager import MultiModelManager
 from .schema import AnswerArtifacts, PipelineStep, SearchResult
+from .hooks import HookEvent, HookRegistry
+from .error_recovery import ErrorRecoveryManager, RetryPolicy
+from .streaming import ContextCompactor, StreamChunk, StreamingManager
+from .web_tools import WebFetchTool, WebSearchTool
 from ..utils.azure_clients import AzureClientFactory
 from ..config import Config
 from ..generation.evidence_extractor import EvidenceExtractor
@@ -40,12 +44,22 @@ class KoreanDocAgent:
     Azure AI Search의 Hybrid Search (BM25 키워드 + Vector 유사성 + Semantic Ranking)을 활용하여
     문맥을 찾고, GPT-5.4를 통해 지능적인 답변을 생성합니다.
 
-    [2026-04 v4.6 업데이트]
+    [2026-04 v5.0 업데이트]
+    - 병렬 도구 실행: 안전한 도구(검색, 임베딩)를 병렬 배치로 처리
+    - 자동 컨텍스트 압축: 토큰 한계 근접 시 LLM으로 핵심 요약
+    - Web Search/Fetch: 외부 웹 정보 보강
+    - 스트리밍 응답: 토큰 단위 실시간 출력
+    - Hook 시스템: 파이프라인 단계별 콜백 등록
+    - Agent Routing: 질문 유형별 최적 모델 자동 선택
+    - 에러 자동 복구: 429/413/500 에러에 대한 재시도/폴백/압축
+    - 서브에이전트 위임: 복합 질문 분해 → 병렬 조사 → 종합
+
+    [2026-04 v4.6]
     - live Azure AI Search 인덱스 스키마를 조회해 런타임 필드 매핑 자동 적용
     - evidence 기반 답변에서 citation 수를 제한하고 근거 문서를 diagnostics 상단으로 재정렬
     - faithfulness / hallucination 검증에서 citation 라인을 제외한 answer body 사용
 
-    [2026-02 v4.1 업데이트 - Contextual Retrieval]
+    [2026-02 v4.1 - Contextual Retrieval]
     - Contextual Retrieval (Anthropic 방식): 청크에 맥락 추가하여 BM25 + 벡터 검색 동시 개선
     - Hybrid Search: BM25 키워드 검색 + Vector 유사성 검색 결합 (Reciprocal Rank Fusion)
     - Azure AI Search 네이티브 하이브리드 검색 + 시맨틱 래킹 활용
@@ -100,6 +114,253 @@ class KoreanDocAgent:
             threshold=Config.HALLUCINATION_THRESHOLD,
         )
 
+        # ── [v5.0] 신규 시스템 초기화 ──
+
+        # Hook 시스템
+        self.hook_registry = HookRegistry() if Config.HOOKS_ENABLED else None
+
+        # 스트리밍 매니저
+        self.streaming_manager = StreamingManager(model_key=model_key) if Config.STREAMING_ENABLED else None
+
+        # 자동 컨텍스트 압축
+        self.context_compactor = ContextCompactor(
+            max_context_tokens=Config.AUTO_COMPACT_MAX_CONTEXT_TOKENS,
+            compact_threshold_ratio=Config.AUTO_COMPACT_THRESHOLD_RATIO,
+        ) if Config.AUTO_COMPACT_ENABLED else None
+
+        # 웹 검색/수집 도구
+        self.web_search_tool = WebSearchTool(
+            bing_api_key=Config.BING_API_KEY or None,
+            max_results=Config.WEB_SEARCH_MAX_RESULTS,
+        ) if Config.WEB_SEARCH_ENABLED else None
+        self.web_fetch_tool = WebFetchTool(
+            max_chars=Config.WEB_FETCH_MAX_CHARS,
+        ) if Config.WEB_SEARCH_ENABLED else None
+
+        # 에러 자동 복구 매니저
+        self.error_recovery = ErrorRecoveryManager(
+            RetryPolicy(
+                max_retries=Config.ERROR_RECOVERY_MAX_RETRIES,
+                base_delay=Config.ERROR_RECOVERY_BASE_DELAY,
+                fallback_models=[m.strip() for m in Config.ERROR_RECOVERY_FALLBACK_MODELS if m.strip()],
+            )
+        ) if Config.ERROR_RECOVERY_ENABLED else None
+
+        # 서브에이전트 매니저 — delegate() 외부 호출 시 lazy init
+        self._sub_agent_manager = None
+
+    # ==================== [v5.0] Hook 헬퍼 ====================
+
+    def _run_hook(self, event: HookEvent, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """훅을 실행하고 수정된 데이터를 반환합니다. 차단 시 None 반환."""
+        if not self.hook_registry:
+            return data or {}
+        result = self.hook_registry.run(event, data or {})
+        if result.blocked:
+            return None
+        if result.modified_data:
+            merged = dict(data or {})
+            merged.update(result.modified_data)
+            return merged
+        return data or {}
+
+    # ==================== [v5.0] Agent Routing ====================
+
+    def _route_model_for_question(self, question: str, base_model_key: Optional[str] = None) -> str:
+        """질문 유형에 따라 최적 모델을 선택합니다."""
+        if not Config.AGENT_ROUTING_ENABLED or base_model_key:
+            return base_model_key or Config.DEFAULT_MODEL
+
+        question_type = self.question_classifier.classify(question)
+        routed = Config.AGENT_ROUTING_MAP.get(question_type.category)
+        if routed and routed in Config.MODELS:
+            print(f"   🔀 Agent Routing: {question_type.category} → {routed}")
+            return routed
+        return Config.DEFAULT_MODEL
+
+    # ==================== [v5.0] 병렬 도구 실행 ====================
+
+    def _parallel_search(
+        self,
+        question: str,
+        search_queries: List[str],
+        top_k: int = 5,
+    ) -> Tuple[List[SearchResult], Optional[str]]:
+        """
+        병렬로 벡터 검색 + 웹 검색을 동시 실행합니다.
+
+        Returns:
+            (search_results, web_context): 검색 결과 + 웹 보강 컨텍스트
+        """
+        if not Config.PARALLEL_TOOL_ENABLED:
+            results = self._vector_search(question, search_queries, top_k)
+            web_ctx = self._web_search_augment(question) if self.web_search_tool else None
+            return results, web_ctx
+
+        vector_results = []
+        web_context = None
+
+        with ThreadPoolExecutor(max_workers=Config.PARALLEL_TOOL_MAX_WORKERS) as executor:
+            future_vector = executor.submit(self._vector_search, question, search_queries, top_k)
+
+            future_web = None
+            if self.web_search_tool:
+                future_web = executor.submit(self._web_search_augment, question)
+
+            try:
+                vector_results = future_vector.result(timeout=30)
+            except Exception as e:
+                print(f"   ⚠️ 벡터 검색 실패: {e}")
+
+            if future_web:
+                try:
+                    web_context = future_web.result(timeout=15)
+                except Exception:
+                    pass
+
+        return vector_results, web_context
+
+    # ==================== [v5.0] 웹 검색 보강 ====================
+
+    def _web_search_augment(self, question: str) -> Optional[str]:
+        """웹 검색으로 추가 컨텍스트를 수집합니다."""
+        if not self.web_search_tool:
+            return None
+
+        try:
+            results = self.web_search_tool.search(question)
+            if not results:
+                return None
+            snippets = [f"[웹: {r.title}]\n{r.snippet}" for r in results[:3] if r.snippet]
+            return "\n\n".join(snippets) if snippets else None
+        except Exception as e:
+            print(f"   ⚠️ 웹 검색 실패: {e}")
+            return None
+
+    # ==================== [v5.0] 스트리밍 답변 ====================
+
+    def answer_question_streaming(
+        self,
+        question: str,
+        model_key: Optional[str] = None,
+        top_k: int = 5,
+        use_query_rewrite: bool = True,
+    ) -> Generator[StreamChunk, None, None]:
+        """
+        스트리밍으로 RAG 답변을 생성합니다. [v5.0 신규]
+
+        검색 → 가드레일(injection/gate) → 스트리밍 답변 생성
+
+        Yields:
+            StreamChunk: 텍스트 청크 (is_final=True로 완료 판별)
+        """
+        routed_model = self._route_model_for_question(question, model_key)
+
+        # [v4.7-fix] Injection 검사를 검색 이전에 수행 (보안 강화)
+        if Config.INJECTION_DETECTION_ENABLED:
+            injection = self.injection_detector.detect(question)
+            if injection.blocked:
+                yield StreamChunk(text="입력 내용이 안전하지 않아 요청을 처리할 수 없습니다.", is_final=True)
+                return
+
+        # Hook: pre_search
+        hook_data = self._run_hook(HookEvent.PRE_SEARCH, {"question": question})
+        if hook_data is None:
+            yield StreamChunk(text="Hook에 의해 차단되었습니다.", is_final=True)
+            return
+
+        search_queries = self._prepare_search(question, use_query_rewrite)
+        search_results, web_context = self._parallel_search(question, search_queries, top_k)
+
+        # Hook: post_search
+        self._run_hook(HookEvent.POST_SEARCH, {
+            "question": question, "result_count": len(search_results),
+        })
+
+        # Retrieval gate
+        if Config.RETRIEVAL_GATE_ENABLED:
+            gate = self.retrieval_gate.evaluate(search_results)
+            if not gate.passed and not gate.soft_fail:
+                yield StreamChunk(text=Config.RETRIEVAL_GATE_NOT_FOUND_MESSAGE, is_final=True)
+                return
+
+        # 컨텍스트 구성 (자동 압축 포함)
+        contexts = self._format_contexts(search_results)
+        if web_context:
+            contexts.append(f"[웹 검색 보강]\n{web_context}")
+
+        if self.context_compactor and self.context_compactor.should_compact(contexts):
+            compact_result = self.context_compactor.compact_contexts(contexts, question=question)
+            contexts = [compact_result.summary]
+            print(f"   🗜️ 컨텍스트 압축: {compact_result.original_token_count} → {compact_result.compacted_token_count} tokens")
+
+        # 스트리밍 생성
+        if self.streaming_manager:
+            yield from self.streaming_manager.stream_rag_answer(
+                question=question,
+                contexts=contexts,
+                system_prompt=_RAG_SYSTEM_PROMPT,
+                model_key=routed_model,
+            )
+        else:
+            # 폴백: 일반 생성 후 한번에 반환
+            answer = self._generate_standard_answer(question, contexts, model_key=routed_model)
+            yield StreamChunk(text=answer, is_final=True)
+
+    # ==================== [v5.0] 서브에이전트 위임 ====================
+
+    @property
+    def sub_agent_manager(self):
+        """서브에이전트 매니저를 lazy 초기화합니다."""
+        if self._sub_agent_manager is None and Config.SUB_AGENT_ENABLED:
+            from .sub_agent import SubAgentManager
+            self._sub_agent_manager = SubAgentManager(
+                answer_fn=self.answer_question,
+                model_manager=self.model_manager,
+                max_workers=Config.SUB_AGENT_MAX_WORKERS,
+                timeout=Config.SUB_AGENT_TIMEOUT,
+            )
+        return self._sub_agent_manager
+
+    def answer_question_with_delegation(
+        self,
+        question: str,
+        model_key: Optional[str] = None,
+        top_k: int = 5,
+        use_query_rewrite: bool = True,
+        force_decompose: bool = False,
+    ) -> Union[str, Any]:
+        """
+        서브에이전트 위임이 적용된 답변. 복합 질문 자동 감지. [v5.0 신규]
+
+        Args:
+            question: 사용자 질문
+            model_key: 모델 키
+            top_k: 검색 결과 수
+            use_query_rewrite: 쿼리 확장 여부
+            force_decompose: 강제 분해 여부
+
+        Returns:
+            답변 문자열
+        """
+        if not self.sub_agent_manager:
+            return self.answer_question(question, model_key=model_key, top_k=top_k, use_query_rewrite=use_query_rewrite)
+
+        delegation = self.sub_agent_manager.delegate(
+            question=question,
+            model_key=model_key,
+            force_decompose=force_decompose,
+            top_k=top_k,
+            use_query_rewrite=use_query_rewrite,
+        )
+
+        if delegation.was_decomposed:
+            print(f"   🔀 서브에이전트 완료: {len(delegation.sub_results)}개 태스크, {delegation.total_elapsed_ms:.0f}ms")
+            return delegation.synthesized_answer
+
+        # 분해 불필요 → 일반 답변
+        return self.answer_question(question, model_key=model_key, top_k=top_k, use_query_rewrite=use_query_rewrite)
+
     def _rewrite_query(self, question: str) -> List[str]:
         """
         GPT-5.4를 사용하여 쿼리를 의미적으로 확장합니다.
@@ -131,10 +392,14 @@ class KoreanDocAgent:
             )
 
             result = response.choices[0].message.content.strip()
-            # JSON 배열 파싱
+            # JSON 배열 파싱 (LLM 응답 형식 오류 방어)
             if result.startswith("["):
-                queries = json.loads(result)
-                return queries[:3] if queries else [question]
+                try:
+                    queries = json.loads(result)
+                    if isinstance(queries, list) and queries:
+                        return [str(q) for q in queries[:3]]
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"   ⚠️ Query rewrite JSON 파싱 실패: {e} | 응답: {result[:200]}")
             return [question]
 
         except Exception as e:
@@ -181,7 +446,7 @@ class KoreanDocAgent:
             fields=Config.SEARCH_VECTOR_FIELD,
         )
 
-        select_fields = [field_name for field_name in list(dict.fromkeys([
+        select_fields = list(dict.fromkeys(filter(None, [
             Config.SEARCH_ID_FIELD,
             Config.SEARCH_CONTENT_FIELD,
             Config.SEARCH_ORIGINAL_CONTENT_FIELD,
@@ -190,7 +455,7 @@ class KoreanDocAgent:
             Config.SEARCH_CITATION_FIELD,
             Config.SEARCH_BOUNDING_BOX_FIELD,
             Config.SEARCH_SOURCE_REGIONS_FIELD,
-        ])) if field_name]
+        ])))
 
         deduplicated_results = {}
 
@@ -225,7 +490,7 @@ class KoreanDocAgent:
                         or "알 수 없는 출처"
                     )
                     score = self._extract_search_score(r)
-                    content_key = hashlib.sha1(f"{source}\n{content}".encode("utf-8")).hexdigest()
+                    content_key = hash((source, content))
                     candidate = SearchResult(
                         content=content,
                         source=source,
@@ -493,7 +758,12 @@ class KoreanDocAgent:
     ) -> str:
         context_str = "\n\n".join(contexts) if contexts else "관련된 문서 내용을 찾을 수 없습니다."
         user_prompt = f"[Context]\n{context_str}\n\n[Question]\n{question}"
-        return self.model_manager.get_completion(
+
+        # [v5.0] Hook: pre_generation
+        self._run_hook(HookEvent.PRE_GENERATION, {"question": question, "context_count": len(contexts)})
+
+        # [v5.0] 에러 자동 복구 적용
+        return self.model_manager.get_completion_with_retry(
             prompt=user_prompt,
             model_key=model_key,
             system_message=system_prompt,
@@ -698,9 +968,12 @@ class KoreanDocAgent:
         """
         사용자의 질문에 대해 검색 증강 생성(RAG)을 수행합니다.
 
-        1. Query Rewrite (선택적): 질문을 의미적으로 확장
-        2. AI Search에서 하이브리드 검색(벡터+키워드) 및 시맨틱 랭킹 수행
-        3. 검색된 문맥(Context)을 바탕으로 GPT-5.4로 답변 생성 (출처 정보 포함)
+        [v5.0 통합 파이프라인]
+        1. Hook(pre_search) → Agent Routing(모델 선택)
+        2. Query Rewrite → 병렬 벡터/웹 검색
+        3. Hook(post_search) → 자동 컨텍스트 압축
+        4. Guardrails → 에러 자동 복구 답변 생성
+        5. Hook(post_generation)
 
         Args:
             question: 사용자의 질문 문자열.
@@ -716,20 +989,78 @@ class KoreanDocAgent:
         if return_artifacts and return_context:
             raise ValueError("return_artifacts 와 return_context 는 동시에 사용할 수 없습니다.")
 
+        # [v5.0] Agent Routing — 질문 유형에 따른 최적 모델 선택
+        routed_model = self._route_model_for_question(question, model_key)
+
+        # [v4.7-fix] Injection 검사를 검색 이전에 수행 (보안 강화)
+        if Config.INJECTION_DETECTION_ENABLED:
+            injection = self.injection_detector.detect(question, model_key=routed_model)
+            if injection.blocked:
+                blocked_answer = "입력 내용이 안전하지 않아 요청을 처리할 수 없습니다."
+                if return_artifacts:
+                    return self._finalize_artifacts(
+                        question=question, search_queries=[question],
+                        search_results=[], answer=blocked_answer,
+                        steps=[PipelineStep(name="prompt_injection", passed=False,
+                                            detail={"reason": injection.reason, "score": injection.score})],
+                        model_key=routed_model,
+                    )
+                return (blocked_answer, []) if return_context else blocked_answer
+
+        # [v5.0] Hook: pre_search
+        hook_data = self._run_hook(HookEvent.PRE_SEARCH, {"question": question, "model_key": routed_model})
+        if hook_data is None:
+            blocked_answer = "Hook에 의해 요청이 차단되었습니다."
+            if return_artifacts:
+                return self._finalize_artifacts(
+                    question=question, search_queries=[question],
+                    search_results=[], answer=blocked_answer, model_key=routed_model,
+                )
+            return (blocked_answer, []) if return_context else blocked_answer
+
         print(f"🔎 Searching for: {question} (top_k={top_k}, hybrid=BM25+Vector+Semantic)")
 
         # 0. Query Rewrite (선택적) — 공통 로직
         search_queries = self._prepare_search(question, use_query_rewrite)
 
-        # 1. 벡터 검색 (공통 로직)
-        search_results = self._vector_search(question, search_queries, top_k)
+        # 1. [v5.0] 병렬 검색 (벡터 + 웹)
+        search_results, web_context = self._parallel_search(question, search_queries, top_k)
+
+        # [v5.0] Hook: post_search
+        self._run_hook(HookEvent.POST_SEARCH, {
+            "question": question, "result_count": len(search_results),
+            "web_context": web_context,
+        })
+
+        # [v5.0] 웹 검색 결과를 검색 결과에 추가
+        if web_context:
+            search_results.append(SearchResult(
+                content=web_context,
+                source="web_search",
+                score=0.5,
+                metadata={"web": True},
+            ))
+
+        # [v5.0] 자동 컨텍스트 압축
+        if self.context_compactor:
+            raw_contexts = self._format_contexts(search_results)
+            if self.context_compactor.should_compact(raw_contexts):
+                compact_result = self.context_compactor.compact_contexts(raw_contexts, question=question)
+                print(f"   🗜️ 컨텍스트 압축: {compact_result.original_token_count} → {compact_result.compacted_token_count} tokens")
+
+        # [v5.0] 에러 자동 복구 래핑
         artifacts = self._run_guardrailed_answer(
             question,
             search_results,
-            model_key=model_key,
+            model_key=routed_model,
             system_prompt=_RAG_SYSTEM_PROMPT,
             search_queries=search_queries,
         )
+
+        # [v5.0] Hook: post_generation
+        self._run_hook(HookEvent.POST_GENERATION, {
+            "question": question, "answer": artifacts.answer,
+        })
 
         if return_artifacts:
             return artifacts

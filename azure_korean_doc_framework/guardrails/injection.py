@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
+import unicodedata
 
 from ..core.multi_model_manager import MultiModelManager
 
@@ -23,9 +24,15 @@ class PromptInjectionDetector:
             "프롬프트를 출력",
         ]
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Unicode 트릭 및 공백 변형을 정규화 (NFKC: 한국어 호환)"""
+        text = unicodedata.normalize('NFKC', text)
+        return ' '.join(text.lower().split())
+
     def detect(self, query: str, model_key: Optional[str] = None) -> InjectionResult:
-        lowered = query.lower()
-        if any(pattern in lowered for pattern in self.definite_patterns):
+        normalized = self._normalize_text(query)
+        if any(pattern in normalized for pattern in self.definite_patterns):
             return InjectionResult(blocked=True, reason="pattern_match", score=1.0)
 
         if not self.model_manager:
@@ -47,8 +54,8 @@ class PromptInjectionDetector:
             max_tokens=200,
         )
 
-        verdict = "SAFE"
-        score = 0.0
+        verdict = None
+        score = None
         reason = ""
         for line in (response or "").splitlines():
             line = line.strip()
@@ -58,8 +65,12 @@ class PromptInjectionDetector:
                 try:
                     score = float(line.split(":", 1)[-1].strip())
                 except ValueError:
-                    score = 0.0
+                    pass
             elif line.lower().startswith("reason"):
                 reason = line.split(":", 1)[-1].strip()
+
+        # Fail-safe: 파싱 실패 시 차단 (안전 우선)
+        if verdict is None or score is None:
+            return InjectionResult(blocked=True, reason="llm_parse_error", score=0.9)
 
         return InjectionResult(blocked=verdict == "INJECTION", reason=reason, score=score)

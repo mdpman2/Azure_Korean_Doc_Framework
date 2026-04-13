@@ -19,6 +19,12 @@ class Config:
     - `AZURE_OPENAI_*` 와 `OPEN_AI_*` 별칭을 함께 지원
     - 고성능 endpoint/key는 기본 endpoint/key와 동일 값 사용 가능
 
+    [2026-04 v4.7 — EdgeQuake 참조 강화]
+    - GRAPH_GLEANING_PASSES: Multi-Pass 엔티티 추출 횟수 (Gleaning)
+    - GRAPH_MIX_WEIGHT: Mix Query Mode 그래프 가중치 (0.0~1.0)
+    - GRAPH_INJECTION_FILE: 도메인 용어집/동의어 주입 파일 경로
+    - GRAPH_QUERY_MODE에 mix/bypass 모드 추가
+
     [2026-04 v4.6]
     - doctor/status/session CLI가 그대로 참조하는 운영 설정 집합
     - Azure AI Search 필드명은 런타임 스키마 조회 결과로 자동 보정될 수 있음
@@ -154,11 +160,31 @@ class Config:
     # 엔티티 추출 배치 크기
     GRAPH_ENTITY_BATCH_SIZE = int(os.getenv("GRAPH_ENTITY_BATCH_SIZE", "5"))
 
-    # 그래프 검색 모드 (local, global, hybrid, naive)
+    # 그래프 검색 모드 (local, global, hybrid, naive, mix, bypass)
     GRAPH_QUERY_MODE = os.getenv("GRAPH_QUERY_MODE", "hybrid")
 
     # 그래프 검색 top_k
     GRAPH_TOP_K = int(os.getenv("GRAPH_TOP_K", "10"))
+
+    # =================================================================
+    # [v4.7] EdgeQuake 강화 설정 (Gleaning, Normalization, Community, Mix, Injection)
+    # =================================================================
+
+    # Gleaning: Multi-Pass 추출 횟수 (0=비활성, 1=1회 추가, 2=2회 추가)
+    # EdgeQuake 벤치마크에 따르면 1회 Gleaning으로 엔티티 15-25% 추가 포착
+    GRAPH_GLEANING_PASSES = int(os.getenv("GRAPH_GLEANING_PASSES", "1"))
+
+    # Mix Query Mode: 그래프 결과 가중치 (0.0~1.0, 기본 0.4)
+    # 0.0 = 벡터 결과만, 0.5 = 반반, 1.0 = 그래프 결과만
+    GRAPH_MIX_WEIGHT = float(os.getenv("GRAPH_MIX_WEIGHT", "0.4"))
+    # [v4.7-fix] 범위 검증: 0.0 ~ 1.0
+    if not (0.0 <= GRAPH_MIX_WEIGHT <= 1.0):
+        print(f"⚠️ GRAPH_MIX_WEIGHT={GRAPH_MIX_WEIGHT}이 범위 밖(반드시 0.0~1.0)입니다. 기본값 0.4로 설정합니다.")
+        GRAPH_MIX_WEIGHT = 0.4
+
+    # Knowledge Injection 파일 경로 (선택사항)
+    # 형식: 각 줄 "용어 (동의어1, 동의어2): 정의"
+    GRAPH_INJECTION_FILE = os.getenv("GRAPH_INJECTION_FILE", "")
 
     # =================================================================
     # Contextual Retrieval 설정 (v4.1 신규 - Anthropic 방식)
@@ -220,6 +246,65 @@ class Config:
     HALLUCINATION_THRESHOLD = float(os.getenv("HALLUCINATION_THRESHOLD", "0.8"))
 
     EVALUATION_JUDGE_MODEL = os.getenv("EVALUATION_JUDGE_MODEL", "gpt-5.4")
+
+    # =================================================================
+    # [v5.0] 스트리밍 설정
+    # =================================================================
+    STREAMING_ENABLED = os.getenv("STREAMING_ENABLED", "true").lower() == "true"
+
+    # =================================================================
+    # [v5.0] 자동 압축 설정
+    # =================================================================
+    AUTO_COMPACT_ENABLED = os.getenv("AUTO_COMPACT_ENABLED", "true").lower() == "true"
+    AUTO_COMPACT_MAX_CONTEXT_TOKENS = int(os.getenv("AUTO_COMPACT_MAX_CONTEXT_TOKENS", "120000"))
+    AUTO_COMPACT_THRESHOLD_RATIO = float(os.getenv("AUTO_COMPACT_THRESHOLD_RATIO", "0.85"))
+
+    # =================================================================
+    # [v5.0] 웹 검색/수집 설정
+    # =================================================================
+    WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
+    BING_API_KEY = os.getenv("BING_API_KEY", "")
+    WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
+    WEB_FETCH_MAX_CHARS = int(os.getenv("WEB_FETCH_MAX_CHARS", "8000"))
+
+    # =================================================================
+    # [v5.0] 에러 자동 복구 설정
+    # =================================================================
+    ERROR_RECOVERY_ENABLED = os.getenv("ERROR_RECOVERY_ENABLED", "true").lower() == "true"
+    ERROR_RECOVERY_MAX_RETRIES = int(os.getenv("ERROR_RECOVERY_MAX_RETRIES", "3"))
+    ERROR_RECOVERY_BASE_DELAY = float(os.getenv("ERROR_RECOVERY_BASE_DELAY", "1.0"))
+    ERROR_RECOVERY_FALLBACK_MODELS = os.getenv(
+        "ERROR_RECOVERY_FALLBACK_MODELS", "gpt-5.2,gpt-4.1"
+    ).split(",")
+
+    # =================================================================
+    # [v5.0] 서브에이전트 위임 설정
+    # =================================================================
+    SUB_AGENT_ENABLED = os.getenv("SUB_AGENT_ENABLED", "true").lower() == "true"
+    SUB_AGENT_MAX_WORKERS = int(os.getenv("SUB_AGENT_MAX_WORKERS", "3"))
+    SUB_AGENT_TIMEOUT = int(os.getenv("SUB_AGENT_TIMEOUT", "60"))
+
+    # =================================================================
+    # [v5.0] Agent Routing (질문 유형별 모델 분기)
+    # =================================================================
+    AGENT_ROUTING_ENABLED = os.getenv("AGENT_ROUTING_ENABLED", "true").lower() == "true"
+    # 질문 유형 → 모델 매핑 (JSON 형식 또는 기본값)
+    AGENT_ROUTING_MAP = {
+        "regulatory": os.getenv("AGENT_ROUTING_REGULATORY", "gpt-5.4"),
+        "extraction": os.getenv("AGENT_ROUTING_EXTRACTION", "gpt-4.1"),
+        "explanatory": os.getenv("AGENT_ROUTING_EXPLANATORY", "gpt-5.4"),
+    }
+
+    # =================================================================
+    # [v5.0] Hook 시스템 설정
+    # =================================================================
+    HOOKS_ENABLED = os.getenv("HOOKS_ENABLED", "true").lower() == "true"
+
+    # =================================================================
+    # [v5.0] 병렬 도구 실행 설정
+    # =================================================================
+    PARALLEL_TOOL_ENABLED = os.getenv("PARALLEL_TOOL_ENABLED", "true").lower() == "true"
+    PARALLEL_TOOL_MAX_WORKERS = int(os.getenv("PARALLEL_TOOL_MAX_WORKERS", "5"))
 
     @classmethod
     def get_openai_credentials(cls, prefer_advanced: bool = True):

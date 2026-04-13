@@ -20,16 +20,27 @@ class KoreanPIIDetector:
 
     def detect(self, text: str) -> List[PIIMatch]:
         matches: List[PIIMatch] = []
+        seen_spans: set = set()
         for match_type, pattern in self.patterns.items():
             for match in pattern.finditer(text):
-                matches.append(PIIMatch(match_type=match_type, text=match.group()))
+                span = (match.start(), match.end())
+                if span not in seen_spans:
+                    seen_spans.add(span)
+                    matches.append(PIIMatch(match_type=match_type, text=match.group()))
         return matches
 
     def mask(self, text: str) -> str:
-        masked = text
-        for pii_match in self.detect(text):
-            masked = masked.replace(pii_match.text, self._mask_value(pii_match.text))
-        return masked
+        # 오프셋 기반 역순 치환으로 위치 변동 방지
+        replacements = []
+        for match_type, pattern in self.patterns.items():
+            for match in pattern.finditer(text):
+                replacements.append((match.start(), match.end(), self._mask_value(match.group())))
+        # 뒤에서부터 치환하여 앞쪽 오프셋 유지
+        replacements.sort(key=lambda x: x[0], reverse=True)
+        chars = list(text)
+        for start, end, masked_val in replacements:
+            chars[start:end] = list(masked_val)
+        return "".join(chars)
 
     def _mask_value(self, value: str) -> str:
         if len(value) <= 4:

@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Generator, Optional, Dict, Any
 from functools import lru_cache
 from ..config import Config
 from ..utils.azure_clients import AzureClientFactory
@@ -136,3 +136,99 @@ class MultiModelManager:
             temperature=temperature,
             response_format=response_format
         )
+
+    def get_streaming_completion(
+        self,
+        prompt: str,
+        model_key: Optional[str] = None,
+        system_message: str = "You are a helpful assistant.",
+        temperature: float = 0.7,
+        max_tokens: int = 4000,
+    ) -> Generator[str, None, None]:
+        """
+        스트리밍으로 텍스트를 생성합니다. 토큰 단위 실시간 출력.
+
+        [v5.0 신규]
+
+        Yields:
+            생성된 텍스트 조각
+        """
+        key = model_key or self.default_model
+        model_name = Config.MODELS.get(key)
+        is_advanced, is_gpt5_series, _ = _classify_model(key)
+        client = AzureClientFactory.get_openai_client(is_advanced=is_advanced)
+
+        if not model_name:
+            model_name = Config.MODELS.get(self.default_model)
+            key = self.default_model
+            _, is_gpt5_series, _ = _classify_model(key)
+
+        params = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+            "stream": True,
+        }
+        if is_gpt5_series:
+            params["max_completion_tokens"] = max_tokens
+        else:
+            params["max_tokens"] = max_tokens
+
+        try:
+            response = client.chat.completions.create(**params)
+            for event in response:
+                if event.choices and event.choices[0].delta and event.choices[0].delta.content:
+                    yield event.choices[0].delta.content
+        except Exception as e:
+            yield f"\n❌ 스트리밍 오류: {e}"
+
+    def get_completion_with_retry(
+        self,
+        prompt: str,
+        model_key: Optional[str] = None,
+        system_message: str = "You are a helpful assistant.",
+        temperature: float = 0.7,
+        max_tokens: int = 4000,
+        **kwargs,
+    ) -> str:
+        """
+        에러 자동 복구가 적용된 텍스트 생성. [v5.0 신규]
+
+        Returns:
+            생성된 텍스트. 모든 재시도 실패 시 에러 메시지 반환.
+        """
+        if not Config.ERROR_RECOVERY_ENABLED:
+            return self.get_completion(
+                prompt=prompt, model_key=model_key,
+                system_message=system_message, temperature=temperature,
+                max_tokens=max_tokens, **kwargs,
+            )
+
+        from .error_recovery import ErrorRecoveryManager, RetryPolicy
+
+        policy = RetryPolicy(
+            max_retries=Config.ERROR_RECOVERY_MAX_RETRIES,
+            base_delay=Config.ERROR_RECOVERY_BASE_DELAY,
+            fallback_models=[m.strip() for m in Config.ERROR_RECOVERY_FALLBACK_MODELS if m.strip()],
+        )
+        recovery = ErrorRecoveryManager(policy)
+        result = recovery.execute_with_retry(
+            fn=lambda model_key=None: self.get_completion(
+                prompt=prompt,
+                model_key=model_key,
+                system_message=system_message,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **kwargs,
+            ),
+            model_key=model_key,
+        )
+
+        if result.success:
+            if result.retry_records:
+                print(f"   ✅ 복구 성공 (시도: {result.total_attempts}, 최종 모델: {result.final_model})")
+            return result.result
+        return f"❌ 모든 재시도 실패: {result.final_error}"
