@@ -1,5 +1,5 @@
 """
-azure_korean_doc_framework v4.7 통합 CLI 실행 스크립트
+azure_korean_doc_framework v6.0 통합 CLI 실행 스크립트
 
 문서 파싱 → 청킹 → Contextual Retrieval → 인덱싱 → Q&A 테스트를 하나의 CLI로 실행합니다.
 기존 ingestion/Q&A 흐름에 더해 doctor/status, JSON 출력, 세션 저장/복원,
@@ -10,6 +10,13 @@ azure_korean_doc_framework v4.7 통합 CLI 실행 스크립트
 - Graph RAG / 구조화 엔티티 추출 선택 실행
 - `--doctor`, `--status`, `--output-format json` 운영 점검 명령
 - `--save-session`, `--resume-session` 세션 저장/복원
+
+[v6.0] 신규:
+- Agentic Retrieval (Azure AI Search Knowledge Base) 지원
+- Semantic Cache / Prompt Caching / Responses API 통합
+- Content Understanding 파서 통합
+- Neo4j Graph DB 백엔드 선택
+- 비동기 파이프라인 (asyncio)
 
 [v4.7] EdgeQuake 참조 강화:
 - Gleaning (Multi-Pass 추출): GRAPH_GLEANING_PASSES 설정으로 추가 패스 횟수 지정
