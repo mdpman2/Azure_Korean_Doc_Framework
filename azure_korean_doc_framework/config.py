@@ -9,6 +9,13 @@ class Config:
     프레임워크의 모든 설정을 관리하는 중앙 구성 클래스입니다.
     환경 변수(.env)에서 설정값을 읽어옵니다.
 
+    [2026-04 v5.1 — LightRAG 참조 강화 + 성능 최적화]
+    - RERANKER_ENABLED/BACKEND/MODEL/TOP_K: Cross-Encoder Reranker 설정
+    - RERANKER_WARM_UP: Cross-Encoder 모델 사전 로드 (초기화 시 warm-up)
+    - JINA_API_KEY: Jina Reranker 백엔드용
+    - LLM_CACHE_ENABLED/DIR/MAX_MEMORY/TTL: LLM 응답 캐시 설정
+    - RAGAS_JUDGE_MODEL: RAGAS 평가 시 LLM-as-Judge 모델
+
     [2026-02 v4.1 업데이트]
     - Contextual Retrieval (Anthropic 방식) — 청크별 LLM 맥락 생성
     - Hybrid Search: BM25 키워드 + Vector 유사성 + Semantic Ranking 결합
@@ -118,11 +125,11 @@ class Config:
     # 임베딩 설정
     # =================================================================
 
-    # 임베딩 모델 배포명 (text-embedding-3-small 또는 text-embedding-3-large)
-    EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
+    # 임베딩 모델 배포명 (text-embedding-3-large 권장 — MIRACL 다국어 벤치마크 +25%)
+    EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 
-    # 임베딩 차원 (text-embedding-3-small: 1536, large: 3072)
-    EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
+    # 임베딩 차원 (text-embedding-3-large: 3072 기본, 2048 권장 — 품질/비용 최적 밸런스)
+    EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "2048"))
 
     # Azure Document Intelligence 설정
     DI_KEY = os.getenv("AZURE_DI_KEY")
@@ -246,6 +253,95 @@ class Config:
     HALLUCINATION_THRESHOLD = float(os.getenv("HALLUCINATION_THRESHOLD", "0.8"))
 
     EVALUATION_JUDGE_MODEL = os.getenv("EVALUATION_JUDGE_MODEL", "gpt-5.4")
+
+    # =================================================================
+    # [v5.1] Reranker 설정 (LightRAG 참조)
+    # =================================================================
+    # Reranker 활성화 여부
+    RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
+
+    # Reranker 백엔드: cross_encoder | jina | llm | none
+    RERANKER_BACKEND = os.getenv("RERANKER_BACKEND", "cross_encoder")
+
+    # Cross-Encoder 모델명 (로컬)
+    RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+
+    # Jina Reranker API 키 (jina 백엔드 사용 시)
+    JINA_API_KEY = os.getenv("JINA_API_KEY", "")
+
+    # Reranker 후 반환할 상위 결과 수
+    RERANKER_TOP_K = int(os.getenv("RERANKER_TOP_K", "5"))
+
+    # Cross-Encoder 모델 사전 로드 (초기화 시점에 warm-up)
+    RERANKER_WARM_UP = os.getenv("RERANKER_WARM_UP", "false").lower() == "true"
+
+    # =================================================================
+    # [v5.1] LLM 응답 캐시 설정 (LightRAG kv_store 참조)
+    # =================================================================
+    # 캐시 활성화 여부
+    LLM_CACHE_ENABLED = os.getenv("LLM_CACHE_ENABLED", "true").lower() == "true"
+
+    # 캐시 저장 디렉토리
+    LLM_CACHE_DIR = os.getenv("LLM_CACHE_DIR", "output/llm_cache")
+
+    # 메모리 캐시 최대 항목 수
+    LLM_CACHE_MAX_MEMORY = int(os.getenv("LLM_CACHE_MAX_MEMORY", "500"))
+
+    # 캐시 TTL (초, 0=만료 없음)
+    LLM_CACHE_TTL = float(os.getenv("LLM_CACHE_TTL", "0"))
+
+    # =================================================================
+    # [v5.1] RAGAS 평가 설정 (LightRAG RAGAS 통합 참조)
+    # =================================================================
+    # RAGAS 평가용 Judge 모델
+    RAGAS_JUDGE_MODEL = os.getenv("RAGAS_JUDGE_MODEL", "gpt-5.4")
+
+    # =================================================================
+    # [v6.0] Agentic Retrieval 설정 (Azure AI Search Knowledge Base)
+    # =================================================================
+    AGENTIC_RETRIEVAL_ENABLED = os.getenv("AGENTIC_RETRIEVAL_ENABLED", "false").lower() == "true"
+    AGENTIC_KB_NAME = os.getenv("AGENTIC_KB_NAME", "")
+    AGENTIC_OUTPUT_MODE = os.getenv("AGENTIC_OUTPUT_MODE", "extractive_data")  # extractive_data | answer_synthesis
+    AGENTIC_REASONING_EFFORT = os.getenv("AGENTIC_REASONING_EFFORT", "low")  # minimal | low | medium
+    AGENTIC_RETRIEVAL_INSTRUCTIONS = os.getenv("AGENTIC_RETRIEVAL_INSTRUCTIONS", "")
+    AGENTIC_ANSWER_INSTRUCTIONS = os.getenv("AGENTIC_ANSWER_INSTRUCTIONS", "")
+
+    # =================================================================
+    # [v6.0] 비동기(async) 파이프라인 설정
+    # =================================================================
+    ASYNC_PIPELINE_ENABLED = os.getenv("ASYNC_PIPELINE_ENABLED", "true").lower() == "true"
+    ASYNC_MAX_CONCURRENT = int(os.getenv("ASYNC_MAX_CONCURRENT", "5"))
+
+    # =================================================================
+    # [v6.0] Semantic Cache 설정 (임베딩 유사도 기반 캐시 히트)
+    # =================================================================
+    SEMANTIC_CACHE_ENABLED = os.getenv("SEMANTIC_CACHE_ENABLED", "true").lower() == "true"
+    SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))
+
+    # =================================================================
+    # [v6.0] Azure Prompt Caching (반복 시스템 프롬프트 비용 50% 절감)
+    # =================================================================
+    PROMPT_CACHING_ENABLED = os.getenv("PROMPT_CACHING_ENABLED", "true").lower() == "true"
+
+    # =================================================================
+    # [v6.0] Content Understanding 설정 (Azure DI 진화형)
+    # =================================================================
+    CONTENT_UNDERSTANDING_ENABLED = os.getenv("CONTENT_UNDERSTANDING_ENABLED", "false").lower() == "true"
+    CONTENT_UNDERSTANDING_ENDPOINT = os.getenv("CONTENT_UNDERSTANDING_ENDPOINT", "")
+    CONTENT_UNDERSTANDING_KEY = os.getenv("CONTENT_UNDERSTANDING_KEY", "")
+
+    # =================================================================
+    # [v6.0] Responses API 설정 (Chat Completions → Responses API 전환)
+    # =================================================================
+    USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "false").lower() == "true"
+
+    # =================================================================
+    # [v6.0] Graph RAG 스토리지 백엔드 (networkx | neo4j)
+    # =================================================================
+    GRAPH_STORAGE_BACKEND = os.getenv("GRAPH_STORAGE_BACKEND", "networkx")  # networkx | neo4j
+    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 
     # =================================================================
     # [v5.0] 스트리밍 설정
