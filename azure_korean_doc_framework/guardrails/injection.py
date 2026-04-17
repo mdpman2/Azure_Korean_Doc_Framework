@@ -1,3 +1,19 @@
+"""프롬프트 인젝션 공격 탐지 모듈.
+
+사용자 입력에서 프롬프트 인젝션 시도를 탐지하여 차단합니다.
+2단계 검증 전략을 사용합니다:
+  1. 정의된 패턴(한/영) 매칭으로 명확한 인젝션 즉시 차단
+  2. LLM 기반 분류로 패턴에 걸리지 않는 우회 시도 탐지
+
+Unicode NFKC 정규화로 특수문자/공백 변형 공격을 방어합니다.
+
+Usage:
+    detector = PromptInjectionDetector(model_manager)
+    result = detector.detect(user_query)
+    if result.blocked:
+        print(f"인젝션 차단: {result.reason}")
+"""
+
 from dataclasses import dataclass
 from typing import Optional
 import unicodedata
@@ -7,12 +23,21 @@ from ..core.multi_model_manager import MultiModelManager
 
 @dataclass
 class InjectionResult:
+    """인젝션 탐지 결과.
+
+    Attributes:
+        blocked: 차단 여부.
+        reason: 차단 사유 ('pattern_match' 또는 LLM 판정 사유).
+        score: 인젝션 확률 점수 (0.0~1.0).
+    """
     blocked: bool
     reason: str = ""
     score: float = 0.0
 
 
 class PromptInjectionDetector:
+    """2단계 프롬프트 인젝션 탐지기 (패턴 매칭 + LLM 분류)."""
+
     def __init__(self, model_manager: Optional[MultiModelManager] = None):
         self.model_manager = model_manager
         self.definite_patterns = [

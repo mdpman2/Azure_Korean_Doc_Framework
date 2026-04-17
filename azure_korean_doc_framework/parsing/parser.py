@@ -1,6 +1,7 @@
 import os
 import re
 import base64
+import requests
 from bisect import bisect_right
 from io import BytesIO
 from typing import List, Dict, Any, Optional, Tuple
@@ -22,6 +23,11 @@ class HybridDocumentParser:
 
     [2026-02 v4.0.1 최적화]
     - import re 모듈 최상단 이동
+
+    [2026-04 v6.0 — Content Understanding]
+    - Azure Content Understanding 통합 (Document Intelligence 진화형)
+    - 텍스트 + 이미지 + 오디오 + 비디오 통합 분석
+    - CONTENT_UNDERSTANDING_ENABLED=true 시 우선 사용
     """
 
     def __init__(self, vision_model: str = None):
@@ -30,6 +36,138 @@ class HybridDocumentParser:
         self.aoai_client = AzureClientFactory.get_openai_client(is_advanced=True)
         # Vision 모델: GPT-5.4 기본 사용 (Config.VISION_MODEL)
         self.gpt_model = vision_model or Config.MODELS.get(Config.VISION_MODEL, Config.VISION_MODEL)
+
+        # [v6.0] Content Understanding 클라이언트 초기화
+        self._cu_enabled = (
+            Config.CONTENT_UNDERSTANDING_ENABLED
+            and Config.CONTENT_UNDERSTANDING_ENDPOINT
+            and Config.CONTENT_UNDERSTANDING_KEY
+        )
+        if self._cu_enabled:
+            self._cu_endpoint = Config.CONTENT_UNDERSTANDING_ENDPOINT.rstrip("/")
+            self._cu_key = Config.CONTENT_UNDERSTANDING_KEY
+            print("🧠 Content Understanding 활성화됨")
+
+    def _analyze_with_content_understanding(self, file_path: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        [v6.0] Azure Content Understanding API로 문서를 분석합니다.
+        Document Intelligence의 진화형으로, 텍스트·이미지·표·차트를 통합 분석합니다.
+
+        Args:
+            file_path: 분석할 파일 경로
+
+        Returns:
+            세그먼트 리스트 또는 None (실패 시 기존 DI 파이프라인으로 폴백)
+        """
+        if not self._cu_enabled:
+            return None
+
+        try:
+            print(f"🧠 Content Understanding 분석 시작: {os.path.basename(file_path)}")
+
+            # 파일 업로드 및 분석 요청
+            url = f"{self._cu_endpoint}/contentunderstanding/analyzers/document:analyze"
+            params = {"api-version": "2025-05-01-preview"}
+            headers = {
+                "Ocp-Apim-Subscription-Key": self._cu_key,
+                "Content-Type": "application/json",
+            }
+
+            # 파일을 base64로 인코딩하여 전송
+            with open(file_path, "rb") as f:
+                file_data = base64.b64encode(f.read()).decode("utf-8")
+
+            ext = os.path.splitext(file_path)[1].lower()
+            mime_map = {
+                ".pdf": "application/pdf",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+            }
+            mime_type = mime_map.get(ext, "application/octet-stream")
+
+            body = {
+                "url": f"data:{mime_type};base64,{file_data}",
+            }
+
+            resp = requests.post(url, headers=headers, params=params, json=body, timeout=120)
+
+            if resp.status_code == 202:
+                # 비동기 작업 — Operation-Location 헤더에서 폴링
+                operation_url = resp.headers.get("Operation-Location", "")
+                if operation_url:
+                    return self._poll_content_understanding(operation_url)
+
+            elif resp.status_code == 200:
+                result = resp.json()
+                return self._parse_cu_result(result)
+
+            print(f"   ⚠️ Content Understanding 응답 코드: {resp.status_code}")
+            return None
+
+        except Exception as e:
+            print(f"   ⚠️ Content Understanding 실패, DI 폴백: {e}")
+            return None
+
+    def _poll_content_understanding(self, operation_url: str, max_wait: int = 120) -> Optional[List[Dict[str, Any]]]:
+        """Content Understanding 비동기 작업 폴링"""
+        import time
+        headers = {"Ocp-Apim-Subscription-Key": self._cu_key}
+        elapsed = 0
+        interval = 2
+
+        while elapsed < max_wait:
+            time.sleep(interval)
+            elapsed += interval
+            resp = requests.get(operation_url, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            status = data.get("status", "")
+            if status == "succeeded":
+                return self._parse_cu_result(data.get("result", data))
+            elif status in ("failed", "canceled"):
+                print(f"   ⚠️ Content Understanding 작업 실패: {status}")
+                return None
+            # running → 계속 대기
+
+        print(f"   ⚠️ Content Understanding 타임아웃 ({max_wait}초)")
+        return None
+
+    def _parse_cu_result(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Content Understanding 분석 결과를 세그먼트 리스트로 변환"""
+        segments = []
+        contents = result.get("contents", result.get("analyzeResult", {}).get("contents", []))
+
+        for idx, content in enumerate(contents):
+            content_type = content.get("type", "text")
+            text = content.get("content", content.get("text", ""))
+            page = content.get("pageNumber", content.get("page", 1))
+
+            if content_type in ("table",):
+                seg_type = "table"
+            elif content_type in ("figure", "image", "chart"):
+                seg_type = "image"
+                desc = content.get("description", "")
+                if desc:
+                    text = f"> **[이미지/차트 설명 {idx+1}]**\n> {desc}"
+            elif content_type in ("title", "sectionHeading"):
+                seg_type = "header"
+            else:
+                seg_type = "text"
+
+            if text:
+                segments.append({
+                    "type": seg_type,
+                    "content": text,
+                    "offset": idx * 100,
+                    "page": page,
+                })
+
+        print(f"   🧠 Content Understanding 완료: {len(segments)}개 세그먼트 추출")
+        return segments
 
     def _encode_image_base64(self, pil_image: Image.Image) -> str:
         """PIL 이미지를 Base64 문자열로 인코딩합니다."""
@@ -219,9 +357,19 @@ class HybridDocumentParser:
         """
         파일 형식(PDF, PPTX, DOCX)에 따라 하이브리드 파싱 수행
         반환값: List[Dict] (구조화된 문서 세그먼트 리스트)
+
+        [v6.0] Content Understanding가 활성화된 경우 우선 사용,
+               실패 시 기존 DI + GPT Vision 파이프라인으로 폴백
         """
         file_ext = os.path.splitext(file_path)[1].lower()
         print(f"🚀 Parsing started: {file_path} ({file_ext})")
+
+        # [v6.0] Content Understanding 우선 시도
+        if self._cu_enabled:
+            cu_result = self._analyze_with_content_understanding(file_path)
+            if cu_result:
+                return cu_result
+            print("   ↩️ Content Understanding 폴백 → DI + GPT Vision 파이프라인")
 
         # 1. Image 변환 (PDF인 경우만 Visual RAG용)
         page_images = None

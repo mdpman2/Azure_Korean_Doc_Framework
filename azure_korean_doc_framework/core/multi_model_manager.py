@@ -25,9 +25,85 @@ class MultiModelManager:
     - Structured Outputs 지원
     - max_completion_tokens 파라미터 사용 (GPT-5.x)
     - reasoning_effort 파라미터 지원 (추론 모델)
+
+    [2026-04 v6.0 업데이트]
+    - Responses API 지원 (USE_RESPONSES_API=true 시)
+    - Prompt Caching 지원 (PROMPT_CACHING_ENABLED=true 시 store=true)
     """
     def __init__(self, default_model: Optional[str] = None):
         self.default_model = default_model or Config.DEFAULT_MODEL
+
+    def _call_responses_api(
+        self,
+        client,
+        model_name: str,
+        prompt: str,
+        system_message: str = "You are a helpful assistant.",
+        temperature: float = 0.7,
+        max_tokens: int = 4000,
+        reasoning_effort: Optional[str] = None,
+        is_gpt5_series: bool = False,
+        is_reasoning_model: bool = False,
+    ) -> str:
+        """
+        [v6.0] Responses API를 사용하여 텍스트 생성을 수행합니다.
+        Chat Completions 대비 장점:
+        - 상태 유지 세션 (previous_response_id)
+        - 도구 + 구조화 출력 + 스트리밍 통합
+        - 내장 웹 검색/파일 검색 도구
+
+        Args:
+            client: OpenAI 클라이언트
+            model_name: 모델 배포명
+            prompt: 사용자 프롬프트
+            system_message: 시스템 메시지
+            temperature: 생성 온도
+            max_tokens: 최대 토큰 수
+            reasoning_effort: 추론 강도
+            is_gpt5_series: GPT-5.x 시리즈 여부
+            is_reasoning_model: 추론 모델 여부
+
+        Returns:
+            생성된 텍스트
+        """
+        print(f"   🔄 Responses API 사용")
+
+        response_params: Dict[str, Any] = {
+            "model": model_name,
+            "input": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+        }
+
+        # max_output_tokens
+        if is_gpt5_series:
+            response_params["max_output_tokens"] = max_tokens
+
+        # Reasoning effort
+        if reasoning_effort and is_reasoning_model:
+            response_params["reasoning"] = {"effort": reasoning_effort}
+
+        # [v6.0] Prompt Caching: store=true 설정
+        if Config.PROMPT_CACHING_ENABLED:
+            response_params["store"] = True
+
+        response = client.responses.create(**response_params)
+
+        # Responses API 결과에서 텍스트 추출
+        if hasattr(response, "output"):
+            for item in response.output:
+                if hasattr(item, "content"):
+                    for content_part in item.content:
+                        if hasattr(content_part, "text"):
+                            return content_part.text
+        # 폴백: output_text 속성
+        if hasattr(response, "output_text"):
+            return response.output_text
+
+        print(f"   ⚠️ Responses API: 표준 응답 구조를 찾지 못함. str(response) 폴백 사용.")
+        return str(response)
 
     def get_completion(
         self,
@@ -71,7 +147,21 @@ class MultiModelManager:
 
         print(f"🤖 LLM 호출 중: {key} (배포명: {model_name}, 고성능: {is_advanced}, GPT-5.x: {is_gpt5_series})")
         try:
-            # 기본 파라미터 구성
+            # [v6.0] Responses API 분기 (response_format 미사용 시)
+            if Config.USE_RESPONSES_API and not response_format:
+                return self._call_responses_api(
+                    client=client,
+                    model_name=model_name,
+                    prompt=prompt,
+                    system_message=system_message,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    is_gpt5_series=is_gpt5_series,
+                    is_reasoning_model=is_reasoning_model,
+                )
+
+            # 기본 파라미터 구성 (Chat Completions API)
             completion_params = {
                 "model": model_name,
                 "messages": [
@@ -96,6 +186,10 @@ class MultiModelManager:
             if response_format:
                 completion_params["response_format"] = response_format
                 print(f"   📋 Structured Output enabled")
+
+            # [v6.0] Prompt Caching: store=true로 반복 시스템 프롬프트 캐싱
+            if Config.PROMPT_CACHING_ENABLED:
+                completion_params["store"] = True
 
             response = client.chat.completions.create(**completion_params)
             return response.choices[0].message.content

@@ -76,7 +76,8 @@ class Reranker:
             from sentence_transformers import CrossEncoder
         except (ImportError, Exception):
             print("   ⚠️ sentence-transformers 로드 실패. pip install sentence-transformers")
-            self.backend = RerankerBackend.NONE
+            print("   🔄 LLM 기반 Reranker로 폴백합니다.")
+            self.backend = RerankerBackend.LLM
             return None
 
         model = self.model_name or "BAAI/bge-reranker-v2-m3"
@@ -85,7 +86,8 @@ class Reranker:
             self._cross_encoder = CrossEncoder(model)
         except Exception as e:
             print(f"   ⚠️ Cross-Encoder 모델 로드 실패: {e}")
-            self.backend = RerankerBackend.NONE
+            print("   🔄 LLM 기반 Reranker로 폴백합니다.")
+            self.backend = RerankerBackend.LLM
             return None
         return self._cross_encoder
 
@@ -293,9 +295,9 @@ class Reranker:
                 if len(reranked) >= top_k:
                     break
 
-            # 순위를 점수로 변환
+            # 순위를 점수로 변환 (top_k > 10인 경우 음수 방지)
             for rank, r in enumerate(reranked):
-                r.metadata["reranker_score"] = 1.0 - (rank * 0.1)
+                r.metadata["reranker_score"] = max(0.01, 1.0 - (rank * 0.1))
 
             return RerankerResult(
                 results=reranked,

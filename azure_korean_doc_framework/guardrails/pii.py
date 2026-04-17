@@ -1,3 +1,15 @@
+"""한국어 개인정보(PII) 탐지 및 마스킹 모듈.
+
+이메일, 휴대전화번호, 주민등록번호, 신용카드번호 등
+한국 기준 개인정보를 정규식으로 탐지하고 자동 마스킹합니다.
+오프셋 기반 역순 치환으로 원본 텍스트의 위치를 정확히 보존합니다.
+
+Usage:
+    detector = KoreanPIIDetector()
+    matches = detector.detect(text)   # PII 탐지
+    masked = detector.mask(text)      # PII 마스킹
+"""
+
 import re
 from dataclasses import dataclass
 from typing import List
@@ -5,11 +17,22 @@ from typing import List
 
 @dataclass
 class PIIMatch:
+    """탐지된 개인정보 항목.
+
+    Attributes:
+        match_type: PII 유형 ('email', 'phone', 'resident_id', 'credit_card').
+        text: 원본 매칭 텍스트.
+    """
     match_type: str
     text: str
 
 
 class KoreanPIIDetector:
+    """한국어 개인정보 탐지기.
+
+    지원하는 PII 유형: 이메일, 휴대전화(01x-xxxx-xxxx),
+    주민등록번호(6자리-7자리), 신용카드번호(4-4-4-4).
+    """
     def __init__(self):
         self.patterns = {
             "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),

@@ -116,8 +116,8 @@ class AdaptiveChunker:
         if _HAS_KSS:
             try:
                 return _kss_module.split_sentences(text)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"   ⚠️ KSS 문장 분리 실패, 정규식 폴백 사용: {e}")
         # Fallback: 정규식 기반 한국어 문장 분리
         sentences = self._SENTENCE_SPLIT_RE.split(text)
         return [s.strip() for s in sentences if s.strip()]

@@ -126,7 +126,7 @@ class VectorStore:
         suffix = " | ".join(part for part in [page_part, bbox_part] if part)
         return f"{fallback_source} | {suffix}" if suffix else fallback_source
 
-    def create_index_if_not_exists(self, vector_dim: int = 1536) -> None:
+    def create_index_if_not_exists(self, vector_dim: int = None) -> None:
         """
         AI Search 인덱스가 존재하지 않으면 생성합니다.
         벡터 검색, 시맨틱 랭킹(Semantic Ranking), Contextual Retrieval 필드를 포함합니다.
@@ -137,8 +137,10 @@ class VectorStore:
         - Config.SEARCH_VECTOR_FIELD: 맥락 포함된 텍스트의 Contextual Embeddings
 
         Args:
-            vector_dim: 벡터 필드의 차원 수 (기본값: 1536 - text-embedding-3-small 기준).
+            vector_dim: 벡터 필드의 차원 수. 기본값: Config.EMBEDDING_DIMENSIONS
+                        (text-embedding-3-large + dimensions=2048 권장)
         """
+        vector_dim = vector_dim or Config.EMBEDDING_DIMENSIONS
         try:
             self.index_client.get_index(self.index_name)
             print(f"✅ 인덱스 존재: '{self.index_name}'")

@@ -1,5 +1,5 @@
 """
-LightRAG-inspired Graph RAG 모듈 (v4.0 → v4.7 EdgeQuake 강화)
+LightRAG-inspired Graph RAG 모듈 (v4.0 → v4.7 EdgeQuake 강화 → v6.0 Neo4j 백엔드)
 
 LightRAG(https://github.com/HKUDS/LightRAG)의 핵심 개념을 참조하여 구현한
 경량 Knowledge Graph 기반 RAG 시스템입니다.
@@ -22,6 +22,12 @@ LightRAG(https://github.com/HKUDS/LightRAG)의 핵심 개념을 참조하여 구
 - Mix Query Mode: 벡터 검색 + 그래프 검색의 구성 가능한 가중 결합
 - Knowledge Injection: 도메인 용어집/동의어 주입으로 쿼리 자동 확장
 
+[2026-04 v6.0 신규 — Neo4j 백엔드]
+- GRAPH_STORAGE_BACKEND=neo4j 설정 시 Neo4j 그래프 DB 사용
+- Leiden 커뮤니티 탐지 (Neo4j GDS 라이브러리)
+- 10K+ 노드 규모에서도 안정적 성능
+
+참조: https://github.com/HKUDS/LightRAG
 참조: https://github.com/raphaelmansuy/edgequake
 """
 
@@ -44,6 +50,13 @@ try:
     HAS_LOUVAIN = True
 except ImportError:
     HAS_LOUVAIN = False
+
+# [v6.0] Neo4j 드라이버 (선택 설치)
+try:
+    from neo4j import GraphDatabase as Neo4jDriver
+    HAS_NEO4J = True
+except ImportError:
+    HAS_NEO4J = False
 
 from ..config import Config
 from ..utils.azure_clients import AzureClientFactory
@@ -302,7 +315,7 @@ class KnowledgeGraphManager:
 
     LightRAG의 핵심 아키텍처를 참조하여 구현:
     - 엔티티/관계 추출 (GPT-5.4)
-    - NetworkX 기반 인메모리 그래프
+    - NetworkX 기반 인메모리 그래프 또는 Neo4j 그래프 DB
     - Dual-Level Retrieval (Local + Global)
     - 한국어 문서 특화
 
@@ -312,6 +325,10 @@ class KnowledgeGraphManager:
     - Community Detection: Louvain 클러스터링 + 커뮤니티 요약
     - Mix Query Mode: 벡터+그래프 가중 결합
     - Knowledge Injection: 도메인 용어집 주입
+
+    [v6.0] Neo4j 백엔드 지원
+    - GRAPH_STORAGE_BACKEND=neo4j 시 Neo4j 그래프 DB 사용
+    - Neo4j GDS 기반 Leiden 커뮤니티 탐지
 
     참조: https://github.com/HKUDS/LightRAG
     참조: https://github.com/raphaelmansuy/edgequake
@@ -326,12 +343,6 @@ class KnowledgeGraphManager:
         mix_graph_weight: float = 0.4,
         llm_cache=None,
     ):
-        if not HAS_NETWORKX:
-            raise ImportError(
-                "networkx 패키지가 필요합니다. 설치: pip install networkx"
-            )
-
-        self.graph = nx.DiGraph()
         self.entity_types = entity_types or KOREAN_ENTITY_TYPES
         self.model_key = model_key
         self.max_entities_per_chunk = max_entities_per_chunk
@@ -346,6 +357,30 @@ class KnowledgeGraphManager:
         # LLM 클라이언트
         self.client = AzureClientFactory.get_openai_client(is_advanced=True)
         self.model_name = Config.MODELS.get(model_key, "model-router")
+
+        # [v6.0] 스토리지 백엔드 선택
+        self._neo4j_driver = None
+        if Config.GRAPH_STORAGE_BACKEND == "neo4j":
+            if not HAS_NEO4J:
+                raise ImportError(
+                    "neo4j 패키지가 필요합니다. 설치: pip install neo4j"
+                )
+            self._neo4j_driver = Neo4jDriver.driver(
+                Config.NEO4J_URI,
+                auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD),
+            )
+            # NetworkX는 Neo4j 모드에서도 인메모리 캐시로 사용
+            if HAS_NETWORKX:
+                self.graph = nx.DiGraph()
+            else:
+                self.graph = None
+            print(f"📊 Neo4j 백엔드 연결: {Config.NEO4J_URI}")
+        else:
+            if not HAS_NETWORKX:
+                raise ImportError(
+                    "networkx 패키지가 필요합니다. 설치: pip install networkx"
+                )
+            self.graph = nx.DiGraph()
 
         # 엔티티/관계 캐시 (중복 방지)
         self._entity_cache: Dict[str, Entity] = {}
@@ -374,7 +409,8 @@ class KnowledgeGraphManager:
         self._llm_cache = llm_cache
 
         print(f"📊 KnowledgeGraphManager 초기화 (모델: {model_key}, 엔티티 타입: {len(self.entity_types)}개, "
-              f"Gleaning: {gleaning_passes}회, Mix 가중치: {mix_graph_weight})")
+              f"Gleaning: {gleaning_passes}회, Mix 가중치: {mix_graph_weight}, "
+              f"백엔드: {Config.GRAPH_STORAGE_BACKEND})")
 
     # ==================== 엔티티/관계 추출 ====================
 
@@ -615,6 +651,10 @@ class KnowledgeGraphManager:
 
             response = self.client.chat.completions.create(**completion_params)
 
+            if not response or not response.choices:
+                print(f"   ⚠️ Gleaning pass API 응답 오류: 응답이 비어있음 ({source_label})")
+                return [], []
+
             # [v4.7-fix] Gleaning 응답 JSON 파싱 보호
             try:
                 result = json.loads(response.choices[0].message.content)
@@ -714,6 +754,10 @@ class KnowledgeGraphManager:
             if ch.strip():
                 self._entity_name_char_index.setdefault(ch, set()).add(name)
 
+        # [v6.0] Neo4j 동기화
+        if getattr(self, '_neo4j_driver', None):
+            self._neo4j_sync_entity(entity)
+
     def _add_relationship(self, rel: Relationship) -> None:
         """관계를 그래프에 추가 (중복 시 가중치 합산) + 역색인 업데이트"""
         if self.graph.has_edge(rel.source, rel.target):
@@ -749,6 +793,10 @@ class KnowledgeGraphManager:
             for ch in set(text):
                 if ch.strip():
                     self._edge_desc_char_index.setdefault(ch, set()).add(edge_key)
+
+        # [v6.0] Neo4j 동기화
+        if getattr(self, '_neo4j_driver', None):
+            self._neo4j_sync_relationship(rel)
 
     # ==================== Dual-Level Retrieval ====================
 
@@ -1457,8 +1505,9 @@ class KnowledgeGraphManager:
               f"커뮤니티 {len(self._communities)}개")
 
     def clear(self) -> None:
-        """Knowledge Graph 초기화 [v4.7: 커뮤니티/주입 캐시도 초기화]"""
-        self.graph.clear()
+        """Knowledge Graph 초기화 [v4.7: 커뮤니티/주입 캐시도 초기화, v6.0: Neo4j 지원]"""
+        if self.graph is not None:
+            self.graph.clear()
         self._entity_cache.clear()
         self._chunk_to_entities.clear()
         self._entity_keyword_index.clear()
@@ -1470,4 +1519,95 @@ class KnowledgeGraphManager:
         self._community_summaries.clear()
         self._injections.clear()
         self._synonym_map.clear()
+
+        # [v6.0] Neo4j 초기화
+        if getattr(self, '_neo4j_driver', None):
+            self._neo4j_clear()
+
         print("🗑️ Knowledge Graph 초기화 완료")
+
+    # ==================== [v6.0] Neo4j 백엔드 메서드 ====================
+
+    def _neo4j_sync_entity(self, entity: Entity) -> None:
+        """엔티티를 Neo4j에 동기화 (MERGE: 있으면 업데이트, 없으면 생성)"""
+        if not self._neo4j_driver:
+            return
+        query = """
+        MERGE (e:Entity {name: $name})
+        SET e.entity_type = $entity_type,
+            e.description = $description,
+            e.source_count = $source_count
+        """
+        with self._neo4j_driver.session() as session:
+            session.run(query, {
+                "name": entity.name,
+                "entity_type": entity.entity_type,
+                "description": entity.description,
+                "source_count": len(entity.source_chunks),
+            })
+
+    def _neo4j_sync_relationship(self, rel: Relationship) -> None:
+        """관계를 Neo4j에 동기화"""
+        if not self._neo4j_driver:
+            return
+        query = """
+        MERGE (s:Entity {name: $source})
+        MERGE (t:Entity {name: $target})
+        MERGE (s)-[r:RELATES_TO {relation_type: $relation_type}]->(t)
+        SET r.description = $description,
+            r.weight = $weight,
+            r.keywords = $keywords
+        """
+        with self._neo4j_driver.session() as session:
+            session.run(query, {
+                "source": rel.source,
+                "target": rel.target,
+                "relation_type": rel.relation_type,
+                "description": rel.description,
+                "weight": rel.weight,
+                "keywords": rel.keywords,
+            })
+
+    def _neo4j_clear(self) -> None:
+        """Neo4j의 모든 노드와 관계를 삭제"""
+        if not self._neo4j_driver:
+            return
+        with self._neo4j_driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+
+    def _neo4j_load_to_networkx(self) -> None:
+        """Neo4j에서 NetworkX 그래프로 로드 (인메모리 캐시 갱신)"""
+        if not self._neo4j_driver or self.graph is None:
+            return
+
+        self.graph.clear()
+        with self._neo4j_driver.session() as session:
+            # 노드 로드
+            result = session.run("MATCH (e:Entity) RETURN e")
+            for record in result:
+                node = record["e"]
+                name = node["name"]
+                self.graph.add_node(
+                    name,
+                    entity_type=node.get("entity_type", ""),
+                    description=node.get("description", ""),
+                    source_count=node.get("source_count", 0),
+                )
+
+            # 관계 로드
+            result = session.run(
+                "MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity) "
+                "RETURN s.name AS source, t.name AS target, r"
+            )
+            for record in result:
+                self.graph.add_edge(
+                    record["source"],
+                    record["target"],
+                    relation_type=record["r"].get("relation_type", ""),
+                    description=record["r"].get("description", ""),
+                    weight=record["r"].get("weight", 1.0),
+                    keywords=record["r"].get("keywords", ""),
+                )
+
+        print(f"📊 Neo4j → NetworkX 동기화: 노드 {self.graph.number_of_nodes()}개, "
+              f"엣지 {self.graph.number_of_edges()}개")

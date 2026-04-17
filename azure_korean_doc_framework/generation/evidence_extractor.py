@@ -1,3 +1,15 @@
+"""근거 추출 및 근거 기반 답변 생성 모듈.
+
+검색된 문서에서 질문과 직접 관련된 근거 문장을 먼저 추출하고,
+추출된 근거만을 사용하여 답변을 생성합니다.
+규정형(regulatory) 및 추출형(extraction) 질문에서
+정확한 수치/사실을 보존하는 것이 핵심 목적입니다.
+
+두 가지 모드를 지원합니다:
+  - extract_short_answer: 문서에서 답만 직접 추출 (단답형)
+  - extract_and_answer: 근거 문장 추출 + 추론 답변 (규정형)
+"""
+
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -8,13 +20,25 @@ from ..core.multi_model_manager import MultiModelManager
 
 @dataclass
 class EvidenceResult:
+    """근거 추출 결과.
+
+    Attributes:
+        answer: 최종 답변 텍스트.
+        evidence_sentences: 문서에서 추출된 근거 문장 목록.
+        sources: 근거 문장이 매칭된 출처 목록 (중복 제거).
+    """
     answer: str
     evidence_sentences: List[str] = field(default_factory=list)
     sources: List[str] = field(default_factory=list)
 
 
 class EvidenceExtractor:
-    """Extract supporting sentences first, then answer from that evidence only."""
+    """근거 우선 추출 후 답변 생성기.
+
+    검색 문서에서 근거 문장을 먼저 추출하고, 추출된 근거만으로
+    답변을 생성하여 할루시네이션과 수치 왜곡을 방지합니다.
+    근거 문장은 원본 문서와의 텍스트 매칭으로 출처를 추적합니다.
+    """
 
     def __init__(self, model_manager: MultiModelManager):
         self.model_manager = model_manager

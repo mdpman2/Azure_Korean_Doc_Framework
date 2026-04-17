@@ -115,7 +115,7 @@ class HookRegistry:
 
     def run(self, event: HookEvent, data: Optional[Dict[str, Any]] = None) -> HookResult:
         """등록된 훅을 실행하고 결과를 반환합니다."""
-        hooks = self._hooks.get(event, [])
+        hooks = list(self._hooks.get(event, []))  # 스냅샷: 이터레이션 중 변경 방지
         ctx = HookContext(event=event, data=data or {})
         errors: List[str] = []
         start = time.perf_counter()
