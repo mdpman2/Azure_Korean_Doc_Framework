@@ -152,6 +152,9 @@ class Config:
     SEARCH_CITATION_FIELD = os.getenv("AZURE_SEARCH_CITATION_FIELD", "citation")
     SEARCH_BOUNDING_BOX_FIELD = os.getenv("AZURE_SEARCH_BOUNDING_BOX_FIELD", "bounding_box_json")
     SEARCH_SOURCE_REGIONS_FIELD = os.getenv("AZURE_SEARCH_SOURCE_REGIONS_FIELD", "source_regions_json")
+    SEARCH_SOURCE_FILE_FIELD = os.getenv("AZURE_SEARCH_SOURCE_FILE_FIELD", "source_file")
+    SEARCH_PAGE_NUMBER_FIELD = os.getenv("AZURE_SEARCH_PAGE_NUMBER_FIELD", "page_number")
+    SEARCH_CHUNK_TYPE_FIELD = os.getenv("AZURE_SEARCH_CHUNK_TYPE_FIELD", "chunk_type")
     SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG", "my-semantic-config")
 
     # =================================================================
