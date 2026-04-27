@@ -5,6 +5,7 @@
 > **2026-04-17 문서 정리**: v6.0 신규 기능 반영, 코드 주석 동기화(guardrails/generation/schema 전체 docstring 추가), 테스트 정리(36개), README 전면 업데이트 완료.
 
 > **최신 기능 요약**
+> - `2026-04-27 정확도 보강`: Azure AI Search에 `source_file`, `page_number`, `chunk_type` 메타데이터 필드 저장, 기존 인덱스 런타임 매핑 자동 보정, 파일/페이지/청크 타입 기반 citation 강화
 > - `v6.0`: Agentic Retrieval(Azure AI Search Knowledge Base), Semantic Cache(임베딩 유사도 퍼지 캐시), Prompt Caching(시스템 프롬프트 비용 50% 절감), Responses API 지원, Content Understanding(Azure DI 진화형), Neo4j Graph DB 백엔드, 비동기 파이프라인
 > - `v5.1`: Cross-Encoder Reranker(검색 정밀도 10-20% 향상), RAGAS 기반 RAG 품질 평가(5개 표준 메트릭), LLM 응답 캐시(비용 90%+ 절감), 성능 최적화(ThreadPool 재사용, 비동기 디스크 캐시, 임베딩 배치 10x, Graph O(N)→O(K), Reranker warm-up)
 > - `v5.0`: 병렬 도구 실행, 자동 컨텍스트 압축, Web Search/Fetch, 스트리밍 응답, Hook 시스템, Agent Routing, 에러 자동 복구, 서브에이전트 위임
@@ -27,12 +28,14 @@
 - **LightRAG 강화 (v5.1)**: Reranker, RAGAS 평가, LLM 응답 캐시, 성능 최적화
 - **v6.0 최적화**: Semantic Cache(임베딩 유사도 퍼지 매칭), Prompt Caching(비용 50% 절감), Responses API, 비동기 파이프라인
 - **운영 포인트**: 기존 Azure AI Search 인덱스 재사용, exact citation, diagnostics, doctor/status, 세션 저장/복원, 라이브 재색인 검증
+- **근거 추적**: `source_file`/`page_number`/`chunk_type` 필터·facet 필드와 bbox/source_regions JSON으로 답변 출처를 파일·페이지·좌표 단위까지 복원
 - **권장 진입 순서**: `설치/환경 변수` → `문서 인덱싱` → `Q&A 테스트` → `운영 진단/평가`
 
 ## 🆕 최근 주요 업데이트
 
 | 버전 | 핵심 추가 내용 | 운영 관점 효과 |
 |------|----------------|----------------|
+| **2026-04-27 정확도 보강** | Azure AI Search 메타데이터 필드(`source_file`, `page_number`, `chunk_type`) 저장, 기존 인덱스 runtime schema mapping 확장, citation source 우선순위 개선 | 파일명/페이지/청크 타입 기반 필터링과 평가가 쉬워지고, 답변 근거가 더 안정적으로 복원됨 |
 | **v6.0** | Agentic Retrieval(Azure AI Search KB 연동), Semantic Cache(임베딩 유사도 퍼지 캐시 3-5x 히트율), Prompt Caching(반복 시스템 프롬프트 비용 50% 절감), Responses API(Chat Completions→Responses 전환), Content Understanding(Azure DI 진화형 문서 분석), Neo4j Graph DB 백엔드, 비동기 파이프라인(asyncio 기반 동시 처리) | 검색 자동 분해+병렬 실행, 캐시 적중률 대폭 향상, API 비용 절감, 대형 그래프 확장성, 파이프라인 처리량 향상 |
 | **v5.1** | Cross-Encoder Reranker(BAAI/bge-reranker-v2-m3, Jina, LLM 폴백), RAGAS 기반 RAG 품질 평가(Context Precision/Recall, Faithfulness, Answer Relevancy/Correctness), LLM 응답 캐시(SHA-256 키, 2단계 LRU+디스크, TTL 지원), ThreadPoolExecutor 재사용, 비동기 디스크 캐시, 임베딩 배치 10x 확대, Graph 검색 O(N)→O(K), Reranker warm-up | 검색 정밀도 10-20% 향상, 검색/생성 단계별 품질 진단, 재인덱싱 비용 90%+ 절감, 응답 속도 향상 |
 | **v4.7** | Gleaning(Multi-Pass 추출), Entity Normalization(정규화+설명 병합), Community Detection(Louvain 클러스터링), Mix Query Mode(벡터+그래프 가중 결합), Knowledge Injection(도메인 용어집/동의어 확장), Bypass Mode | 엔티티 15-25% 추가 포착, 중복 36-40% 제거, 글로벌 주제 검색 강화, 도메인 용어 자동 확장, 검색 유연성 향상 |
@@ -46,7 +49,7 @@
 
 ## 🌟 핵심 기능
 
-### � v6.0 신규 기능 (Azure AI Search 2025 + Responses API)
+### 🚀 v6.0 신규 기능 (Azure AI Search 2025 + Responses API)
 
 Azure AI Search의 최신 Agentic Retrieval, Content Understanding, 그리고 OpenAI Responses API를 통합한 7가지 기능:
 
@@ -114,7 +117,7 @@ ASYNC_PIPELINE_ENABLED=true
 ASYNC_MAX_CONCURRENT=5     # 최대 동시 실행 수
 ```
 
-### �🔄 v5.1 신규 기능 (LightRAG 참조)
+### 🔄 v5.1 신규 기능 (LightRAG 참조)
 
 [LightRAG](https://github.com/HKUDS/LightRAG)의 핵심 기능을 참조하여 정확도와 비용 효율을 극대화하는 3가지 기능:
 
@@ -292,7 +295,7 @@ answer = agent.answer_question_with_delegation(
 )
 ```
 
-### �🛡️ Guardrails + Evaluation (v4.2 신규)
+### 🛡️ Guardrails + Evaluation (v4.2 신규)
 
 검색이 된다고 바로 답변하지 않고, 검색 품질과 답변 안전성을 점검한 뒤 응답하는 운영형 RAG 파이프라인입니다.
 
@@ -611,6 +614,13 @@ AZURE_SEARCH_SEMANTIC_CONFIG=my-semantic-config
 AZURE_SEARCH_CITATION_FIELD=citation
 AZURE_SEARCH_BOUNDING_BOX_FIELD=bounding_box_json
 AZURE_SEARCH_SOURCE_REGIONS_FIELD=source_regions_json
+AZURE_SEARCH_SOURCE_FILE_FIELD=source_file
+AZURE_SEARCH_PAGE_NUMBER_FIELD=page_number
+AZURE_SEARCH_CHUNK_TYPE_FIELD=chunk_type
+
+# source_file: 파일명/문서명을 검색·필터 조건으로 보존합니다.
+# page_number: 첫 페이지 번호를 Int32 facet/filter 필드로 보존합니다.
+# chunk_type: text/table/figure 등 청크 타입을 facet/filter 필드로 보존합니다.
 
 # 선택: 런타임에서 실제 Azure AI Search 인덱스 스키마를 조회하여
 # field / semantic config 매핑을 자동 보정합니다.
@@ -638,6 +648,12 @@ AZURE_SEARCH_SOURCE_REGIONS_FIELD=source_regions_json
 # AZURE_SEARCH_CITATION_FIELD=citation
 # AZURE_SEARCH_BOUNDING_BOX_FIELD=bounding_box_json
 # AZURE_SEARCH_SOURCE_REGIONS_FIELD=source_regions_json
+# AZURE_SEARCH_SOURCE_FILE_FIELD=source_file
+# AZURE_SEARCH_PAGE_NUMBER_FIELD=page_number
+# AZURE_SEARCH_CHUNK_TYPE_FIELD=chunk_type
+
+# 기존 인덱스에 위 필드가 없으면 create_index_if_not_exists()가 증분 추가를 시도합니다.
+# 이미 다른 이름(file_name, page, type 등)을 쓰는 인덱스는 런타임 매핑에서 자동 감지합니다.
 
 # 주의: config.py는 load_dotenv(override=True)를 사용하므로,
 # 워크스페이스 루트 .env 값이 프로젝트 하위 .env 값을 덮어쓸 수 있습니다.
