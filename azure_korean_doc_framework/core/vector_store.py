@@ -76,6 +76,9 @@ class VectorStore:
             SimpleField(name=Config.SEARCH_CITATION_FIELD, type=SearchFieldDataType.String),
             SimpleField(name=Config.SEARCH_BOUNDING_BOX_FIELD, type=SearchFieldDataType.String),
             SimpleField(name=Config.SEARCH_SOURCE_REGIONS_FIELD, type=SearchFieldDataType.String),
+            SearchField(name=Config.SEARCH_SOURCE_FILE_FIELD, type=SearchFieldDataType.String, searchable=True, filterable=True),
+            SimpleField(name=Config.SEARCH_PAGE_NUMBER_FIELD, type=SearchFieldDataType.Int32, filterable=True, facetable=True),
+            SimpleField(name=Config.SEARCH_CHUNK_TYPE_FIELD, type=SearchFieldDataType.String, filterable=True, facetable=True),
             SearchField(name=Config.SEARCH_CONTENT_FIELD, type=SearchFieldDataType.String, searchable=True, analyzer_name="ko.microsoft"),
             SearchField(name=Config.SEARCH_ORIGINAL_CONTENT_FIELD, type=SearchFieldDataType.String, searchable=True),
             SearchField(name=Config.SEARCH_TITLE_FIELD, type=SearchFieldDataType.String, searchable=True),
@@ -101,6 +104,12 @@ class VectorStore:
 
     @staticmethod
     def _build_citation_value(chunk: Document, fallback_source: str) -> str:
+        source_name = (
+            chunk.metadata.get("source_file")
+            or chunk.metadata.get("file_name")
+            or chunk.metadata.get("source")
+            or fallback_source
+        )
         page_numbers = chunk.metadata.get("page_numbers") or []
         if not page_numbers and chunk.metadata.get("page_number") is not None:
             page_numbers = [chunk.metadata.get("page_number")]
@@ -124,7 +133,16 @@ class VectorStore:
             )
 
         suffix = " | ".join(part for part in [page_part, bbox_part] if part)
-        return f"{fallback_source} | {suffix}" if suffix else fallback_source
+        return f"{source_name} | {suffix}" if suffix else str(source_name)
+
+    @staticmethod
+    def _first_page_number(metadata: Dict[str, Any]) -> Optional[int]:
+        page_numbers = metadata.get("page_numbers") or []
+        page_number = page_numbers[0] if page_numbers else metadata.get("page_number")
+        try:
+            return int(page_number) if page_number is not None and page_number != "" else None
+        except (TypeError, ValueError):
+            return None
 
     def create_index_if_not_exists(self, vector_dim: int = None) -> None:
         """
@@ -210,6 +228,23 @@ class VectorStore:
                 index.fields.append(SimpleField(name=Config.SEARCH_SOURCE_REGIONS_FIELD, type=SearchFieldDataType.String))
                 updated = True
 
+            if Config.SEARCH_SOURCE_FILE_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_SOURCE_FILE_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(
+                    SearchField(name=Config.SEARCH_SOURCE_FILE_FIELD, type=SearchFieldDataType.String, searchable=True, filterable=True)
+                )
+                updated = True
+
+            if Config.SEARCH_PAGE_NUMBER_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_PAGE_NUMBER_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(SimpleField(name=Config.SEARCH_PAGE_NUMBER_FIELD, type=SearchFieldDataType.Int32, filterable=True, facetable=True))
+                updated = True
+
+            if Config.SEARCH_CHUNK_TYPE_FIELD not in field_names:
+                print(f"🛠️ '{Config.SEARCH_CHUNK_TYPE_FIELD}' 필드 추가 중: {self.index_name}")
+                index.fields.append(SimpleField(name=Config.SEARCH_CHUNK_TYPE_FIELD, type=SearchFieldDataType.String, filterable=True, facetable=True))
+                updated = True
+
             # v4.1: 원본 텍스트 보존 필드 동적 추가
             if Config.SEARCH_ORIGINAL_CONTENT_FIELD not in field_names:
                 print(f"🛠️ '{Config.SEARCH_ORIGINAL_CONTENT_FIELD}' 필드 추가 중: {self.index_name}")
@@ -285,6 +320,14 @@ class VectorStore:
             # 파일명과 인덱스를 조합하여 고유 ID 생성 (중복 방지)
             parent_id_str = str(chunk.metadata.get("source", "unknown"))
             title = str(chunk.metadata.get("Header 1") or parent_id_str or "No Title")
+            source_file = str(
+                chunk.metadata.get("source_file")
+                or chunk.metadata.get("file_name")
+                or chunk.metadata.get("source")
+                or title
+            )
+            page_number = self._first_page_number(chunk.metadata)
+            chunk_type = str(chunk.metadata.get("chunk_type") or chunk.metadata.get("type") or "text")
             document = {
                 Config.SEARCH_ID_FIELD: self._build_document_id(parent_id_str, i),
                 Config.SEARCH_CONTENT_FIELD: chunk.page_content,
@@ -296,9 +339,12 @@ class VectorStore:
                 Config.SEARCH_CITATION_FIELD: self._build_citation_value(chunk, title),
                 Config.SEARCH_BOUNDING_BOX_FIELD: self._json_dumps(chunk.metadata.get("bounding_box")),
                 Config.SEARCH_SOURCE_REGIONS_FIELD: self._json_dumps(chunk.metadata.get("source_regions")),
+                Config.SEARCH_SOURCE_FILE_FIELD: source_file,
+                Config.SEARCH_PAGE_NUMBER_FIELD: page_number,
+                Config.SEARCH_CHUNK_TYPE_FIELD: chunk_type,
                 Config.SEARCH_VECTOR_FIELD: vector,
             }
-            if Config.SEARCH_SOURCE_FIELD not in document:
+            if Config.SEARCH_SOURCE_FIELD and Config.SEARCH_SOURCE_FIELD not in document:
                 document[Config.SEARCH_SOURCE_FIELD] = title
             documents.append(document)
 
