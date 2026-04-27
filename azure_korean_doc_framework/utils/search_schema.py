@@ -41,6 +41,9 @@ def _resolve_mapping_from_index(index: Any) -> Dict[str, Any]:
     resolved_citation = _pick_first_available(field_names, [Config.SEARCH_CITATION_FIELD, "citation"])
     resolved_bbox = _pick_first_available(field_names, [Config.SEARCH_BOUNDING_BOX_FIELD, "bounding_box_json", "bounding_box"])
     resolved_regions = _pick_first_available(field_names, [Config.SEARCH_SOURCE_REGIONS_FIELD, "source_regions_json", "source_regions"])
+    resolved_source_file = _pick_first_available(field_names, [Config.SEARCH_SOURCE_FILE_FIELD, "source_file", "file_name", "filename"])
+    resolved_page_number = _pick_first_available(field_names, [Config.SEARCH_PAGE_NUMBER_FIELD, "page_number", "page", "page_no"])
+    resolved_chunk_type = _pick_first_available(field_names, [Config.SEARCH_CHUNK_TYPE_FIELD, "chunk_type", "type"])
     resolved_semantic = None
     if semantic_configs:
         resolved_semantic = Config.SEARCH_SEMANTIC_CONFIG if Config.SEARCH_SEMANTIC_CONFIG in semantic_configs else semantic_configs[0]
@@ -60,6 +63,9 @@ def _resolve_mapping_from_index(index: Any) -> Dict[str, Any]:
             "SEARCH_CITATION_FIELD": resolved_citation,
             "SEARCH_BOUNDING_BOX_FIELD": resolved_bbox,
             "SEARCH_SOURCE_REGIONS_FIELD": resolved_regions,
+            "SEARCH_SOURCE_FILE_FIELD": resolved_source_file,
+            "SEARCH_PAGE_NUMBER_FIELD": resolved_page_number,
+            "SEARCH_CHUNK_TYPE_FIELD": resolved_chunk_type,
             "SEARCH_SEMANTIC_CONFIG": resolved_semantic,
         },
     }
