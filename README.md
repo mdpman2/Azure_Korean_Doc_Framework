@@ -2,7 +2,9 @@
 
 이 프로젝트는 Azure AI Services (Document Intelligence, Azure OpenAI GPT-5.4, Azure AI Search)를 활용해 한국어 문서를 정밀 분석하고, 인덱싱부터 검색, 근거 기반 답변까지 연결하는 운영형 RAG 프레임워크입니다.
 
-> **2026-04-17 문서 정리**: v6.0 신규 기능 반영, 코드 주석 동기화(guardrails/generation/schema 전체 docstring 추가), 테스트 정리(36개), README 전면 업데이트 완료.
+> **2026-06-29 안정화 & 현대화 (최신)**: 전체 소스를 점검하여 런타임 크래시·오탐 버그를 수정하고 최신 SDK 관행으로 현대화(openai typed `status_code` 에러 분류, GPT-5.x용 `o200k_base` 토크나이저 등), **uv 기반 설치 전환(`pyproject.toml`)**, **테스트 `tests/` 패키지로 재구성(`uv run pytest` → 36 통과)**, README 갱신 완료. 상세는 아래 "🔧 2026-06-29 안정화 & 현대화" 섹션 참고.
+>
+> _이전: **2026-04-17 문서 정리** — v6.0 신규 기능 반영, 코드 주석 동기화(guardrails/generation/schema docstring), 테스트 정리(36개), README 전면 업데이트._
 
 > **최신 기능 요약**
 > - `2026-06-29 안정화 & 현대화`: 런타임 크래시 방지(가드레일 None 응답/score 파싱, 이미지 RGBA→RGB 인코딩, 엔티티 소스 그라운딩 좌표 보정, 에이전트 리소스 정리 안전화, 청크 경로 CWD 의존 제거), 정확도/정밀도 개선(질문 분류·숫자 검증·PII 숫자 경계 매칭으로 오탐 제거), 현대화(openai typed `status_code` 기반 에러 분류, GPT-5.x용 `o200k_base` 토크나이저, reranker 백엔드 폴백, temperature 미지원 모델 자동 재시도), **uv 기반 설치 전환(`pyproject.toml`)**, **테스트 `tests/` 디렉토리로 정리**
