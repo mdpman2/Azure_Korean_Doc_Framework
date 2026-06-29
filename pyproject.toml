@@ -1,0 +1,60 @@
+[project]
+name = "azure-korean-doc-framework"
+version = "6.0.0"
+description = "Azure 기반 한국어 문서 이해/검색 운영형 RAG 프레임워크 (Document Intelligence + Azure OpenAI + Azure AI Search)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# ============================================================
+# 의존성 단일 출처(Single Source of Truth).
+# 설치(권장): uv sync                                   # 코어 의존성 동기화 + .venv 생성
+#            uv sync --extra neo4j --extra reranker     # 선택 기능 포함
+#            uv pip install -r requirements.txt          # 호환 방식
+# 실행:      uv run python doc_chunk_main.py --path RAG_TEST_DATA
+# ============================================================
+dependencies = [
+    # ===== Azure SDK =====
+    "openai>=1.109.0",
+    "azure-ai-documentintelligence>=1.0.0",
+    "azure-search-documents>=11.6.0",
+
+    # ===== 문서 처리 =====
+    "pymupdf>=1.26.0",
+    "pillow>=12.0.0",
+    "tiktoken>=0.12.0",
+
+    # ===== 한국어 NLP =====
+    "kss>=6.0.0",
+
+    # ===== Graph RAG (NetworkX 기본 백엔드) =====
+    "networkx>=3.4",
+
+    # ===== HTTP 클라이언트 (Agentic Retrieval, Content Understanding) =====
+    "requests>=2.32.0",
+
+    # ===== 유틸리티 =====
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+# Neo4j 그래프 백엔드: GRAPH_STORAGE_BACKEND=neo4j 사용 시  →  uv sync --extra neo4j
+neo4j = ["neo4j>=5.20.0"]
+# Cross-Encoder 로컬 reranker: RERANKER_BACKEND=cross_encoder 사용 시  →  uv sync --extra reranker
+reranker = ["sentence-transformers>=3.0.0"]
+# 모든 선택 기능 한 번에 설치  →  uv sync --extra all
+all = [
+    "neo4j>=5.20.0",
+    "sentence-transformers>=3.0.0",
+]
+
+[tool.uv]
+# 스크립트로 실행되는 프로젝트이므로 로컬 패키지를 빌드/설치하지 않고
+# 의존성만 관리합니다(virtual project).
+package = false
+
+[tool.pytest.ini_options]
+# 테스트는 tests/ 디렉토리에 모여 있습니다.
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v"

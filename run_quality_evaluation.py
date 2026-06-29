@@ -77,7 +77,8 @@ def main():
     parser.add_argument("--top-k", type=int, default=5)
     args = parser.parse_args()
 
-    Config.validate()
+    # 품질 평가 러너는 문서 파싱을 하지 않으므로 Document Intelligence 설정은 필수가 아님
+    Config.validate(require_di=False)
     output_dir = os.path.dirname(args.output)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)

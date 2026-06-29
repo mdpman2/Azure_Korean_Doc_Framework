@@ -1,5 +1,7 @@
-# azure_korean_doc_framework v6.0 — 의존성 패키지
-# 설치: pip install -r requirements.txt
+# azure_korean_doc_framework — 의존성 패키지
+# 설치(권장, uv): uv pip install -r requirements.txt
+#   또는 프로젝트 동기화: uv sync   (pyproject.toml 기반)
+# 참고: 의존성의 단일 출처는 pyproject.toml이며, 이 파일은 호환용입니다.
 
 # ===== Azure SDK =====
 openai>=1.109.0
@@ -21,12 +23,12 @@ networkx>=3.4
 requests>=2.32.0
 
 # ===== [v6.0] Neo4j Graph DB (선택 설치: GRAPH_STORAGE_BACKEND=neo4j 사용 시) =====
-# pip install neo4j
+# uv pip install neo4j     (또는: uv sync --extra neo4j)
 # neo4j>=5.20.0
 
 # ===== Reranker (v5.1 — LightRAG 참조) =====
 # Cross-Encoder 로컬 reranker (선택 설치: RERANKER_BACKEND=cross_encoder 사용 시)
-# pip install sentence-transformers
+# uv pip install sentence-transformers     (또는: uv sync --extra reranker)
 # Jina Reranker는 API 기반이므로 추가 패키지 불필요
 
 # ===== 유틸리티 =====

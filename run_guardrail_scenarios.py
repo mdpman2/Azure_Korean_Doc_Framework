@@ -71,6 +71,21 @@ def build_offline_agent() -> KoreanDocAgent:
     agent.injection_detector = PromptInjectionDetector(fake)
     agent.faithfulness_checker = FaithfulnessChecker(fake, threshold=Config.FAITHFULNESS_THRESHOLD)
     agent.hallucination_detector = HallucinationDetector(fake, threshold=Config.HALLUCINATION_THRESHOLD)
+
+    # 프로덕션 __init__와 동일한 부가 속성(데모에서 미사용 → None)을 채워
+    # 향후 가드레일 경로가 이 속성들을 참조해도 AttributeError가 나지 않도록 합니다.
+    agent.hook_registry = None
+    agent.streaming_manager = None
+    agent.context_compactor = None
+    agent.web_search_tool = None
+    agent.web_fetch_tool = None
+    agent.reranker = None
+    agent.llm_cache = None
+    agent._sub_agent_manager = None
+    agent._parallel_executor = None
+    agent.agentic_retrieval = None
+    agent._async_embedding_client = None
+    agent._async_llm_client = None
     return agent
 
 
